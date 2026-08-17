@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visualizador de log — Bridge CAN</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #f4f5f7; color: #222; }
+  header { padding: 12px 16px; background: #fff; border-bottom: 1px solid #ddd; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  #drop { border: 2px dashed #bbb; border-radius: 8px; padding: 12px; text-align: center;
+          color: #666; transition: .15s; }
+  #drop.hover { border-color: #0a7d2c; background: #eafbef; color: #0a7d2c; }
+  .btn { color: #0a58ca; cursor: pointer; text-decoration: underline; }
+  .btn input { display: none; }
+  #info { margin-top: 8px; font-size: 13px; color: #555; }
+  #controls { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+  #controls label { font-size: 13px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  .sw { width: 22px; height: 3px; border-radius: 2px; display: inline-block; }
+  #controls .sep { width: 1px; height: 18px; background: #ddd; }
+  #controls .grpname { font-size: 12px; color: #888; }
+  #wrap { padding: 10px 16px; }
+  canvas { width: 100%; height: 620px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+  .hint { font-size: 12px; color: #888; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Visualizador de log — Bridge CAN
+    <span style="font-weight:400;color:#888;font-size:13px">(O2 · NOx · triggers no mesmo gráfico)</span></h1>
+  <div id="drop">Arraste um arquivo <b>.csv</b> aqui, ou
+    <label class="btn">escolher arquivo<input type="file" id="file" accept=".csv,text/csv"></label>
+  </div>
+  <div id="info">Nenhum log carregado. Gere um pelo app (botão <b>Gravar log</b>).</div>
+  <div id="controls"></div>
+</header>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div class="hint">Eixo esquerdo = <b>O2</b> · eixo direito = <b>NOx (ppm)</b>.
+    Faixas verdes = <b>CORRIGINDO</b>. Use as caixas acima para mostrar/ocultar cada linha.
+    Passe o mouse para ver os valores.</div>
+</div>
+
+<script>
+"use strict";
+
+// axis: "L" = O2 (eixo esquerdo)  ·  "R" = NOx (eixo direito)
+const SERIES = [
+  { key: "o2r", label: "O2 lido",       color: "#1f77b4", axis: "L", on: true },
+  { key: "o2c", label: "O2 corrigido",  color: "#0a7d2c", axis: "L", on: true },
+  { key: "trg", label: "trigger O2",    color: "#e08a00", axis: "L", dash: [7, 5], on: true },
+  { key: "flr", label: "piso O2",       color: "#c02020", axis: "L", dash: [2, 4], on: true },
+  { key: "nr",  label: "NOx lido",      color: "#9467bd", axis: "R", on: true },
+  { key: "nc",  label: "NOx corrigido", color: "#17a2b8", axis: "R", on: true }
+];
+const BAND = "rgba(10,125,44,0.10)", GRID = "#eee", AXIS = "#999", TXT = "#444";
+
+let DATA = null;          // { rows, tmin, tmax }
+let mouseX = null;
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const info = document.getElementById("info");
+
+// ---------- controles (filtros) ----------
+buildControls();
+function buildControls() {
+  const box = document.getElementById("controls");
+  box.innerHTML = "";
+  const mk = (s) => {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = s.on;
+    cb.addEventListener("change", () => { s.on = cb.checked; draw(); });
+    const sw = document.createElement("span");
+    sw.className = "sw";
+    sw.style.background = s.color;
+    if (s.dash) sw.style.background =
+      `repeating-linear-gradient(90deg,${s.color} 0 6px,transparent 6px 10px)`;
+    lab.append(cb, sw, document.createTextNode(s.label));
+    box.appendChild(lab);
+  };
+  const g1 = document.createElement("span"); g1.className = "grpname"; g1.textContent = "O2:";
+  box.appendChild(g1);
+  SERIES.filter(s => s.axis === "L").forEach(mk);
+  const sep = document.createElement("span"); sep.className = "sep"; box.appendChild(sep);
+  const g2 = document.createElement("span"); g2.className = "grpname"; g2.textContent = "NOx:";
+  box.appendChild(g2);
+  SERIES.filter(s => s.axis === "R").forEach(mk);
+}
+
+// ---------- carregamento ----------
+const drop = document.getElementById("drop");
+document.getElementById("file").addEventListener("change", e => {
+  if (e.target.files[0]) readFile(e.target.files[0]);
+});
+["dragenter", "dragover"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("hover"); }));
+["dragleave", "drop"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hover"); }));
+drop.addEventListener("drop", e => {
+  const f = e.dataTransfer.files[0];
+  if (f) readFile(f);
+});
+
+function readFile(file) {
+  const r = new FileReader();
+  r.onload = () => { DATA = parseCSV(r.result); showInfo(file.name); resize(); };
+  r.readAsText(file);
+}
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim() && !l.startsWith("#"));
+  if (!lines.length) return null;
+  const head = lines[0].split(",").map(s => s.trim());
+  const col = name => head.indexOf(name);
+  const idx = {
+    t: col("t_s"), o2r: col("o2_read"), o2c: col("o2_corr"),
+    nr: col("nox_read"), nc: col("nox_corr"),
+    trg: col("o2_trigger"), flr: col("o2_floor"),
+    st: col("state"), ramp: col("ramp_pct")
+  };
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const p = lines[i].split(",");
+    const num = j => (j >= 0 && j < p.length) ? parseFloat(p[j]) : NaN;
+    const t = num(idx.t);
+    if (!isFinite(t)) continue;
+    rows.push({
+      t, o2r: num(idx.o2r), o2c: num(idx.o2c),
+      nr: num(idx.nr), nc: num(idx.nc),
+      trg: num(idx.trg), flr: num(idx.flr),
+      st: num(idx.st) | 0, ramp: num(idx.ramp)
+    });
+  }
+  if (!rows.length) return null;
+  return { rows, tmin: rows[0].t, tmax: rows[rows.length - 1].t };
+}
+
+function showInfo(name) {
+  const d = DATA;
+  const dur = (d.tmax - d.tmin).toFixed(1);
+  const on = d.rows.filter(r => r.st === 1).length;
+  const pct = (100 * on / d.rows.length).toFixed(0);
+  info.innerHTML = `<b>${name}</b> — ${d.rows.length} amostras · ${dur}s · ` +
+                   `${pct}% do tempo corrigindo`;
+}
+
+// ---------- desenho ----------
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+canvas.addEventListener("mousemove", e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = e.clientX - rect.left;
+  draw();
+});
+canvas.addEventListener("mouseleave", () => { mouseX = null; draw(); });
+
+function niceTicks(min, max, n) {
+  const span = (max - min) || 1;
+  const raw = span / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) ticks.push(v);
+  return ticks;
+}
+
+function axisMax(axis) {
+  const keys = SERIES.filter(s => s.axis === axis && s.on).map(s => s.key);
+  if (!keys.length) return null;
+  let m = 1e-6;
+  for (const r of DATA.rows) for (const k of keys) if (isFinite(r[k])) m = Math.max(m, r[k]);
+  return m * 1.12;
+}
+
+function draw() {
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+  if (!DATA) return;
+
+  const d = DATA, rows = d.rows;
+  const mL = 56, mR = 58, mT = 18, mB = 40;
+  const plotT = mT, plotB = H - mB, plotH = plotB - plotT;
+  const x = t => mL + (t - d.tmin) / ((d.tmax - d.tmin) || 1) * (W - mL - mR);
+
+  const maxL = axisMax("L"), maxR = axisMax("R");
+  const yL = v => plotB - (v / maxL) * plotH;
+  const yR = v => plotB - (v / maxR) * plotH;
+
+  // faixas "corrigindo"
+  for (let i = 0; i < rows.length - 1; i++) {
+    if (rows[i].st === 1) {
+      ctx.fillStyle = BAND;
+      const x0 = x(rows[i].t), x1 = x(rows[i + 1].t);
+      ctx.fillRect(x0, plotT, x1 - x0, plotH);
+    }
+  }
+
+  // grade horizontal + eixo Y esquerdo (O2)
+  ctx.font = "11px Segoe UI";
+  if (maxL !== null) {
+    ctx.textAlign = "right";
+    niceTicks(0, maxL, 6).forEach(v => {
+      const py = yL(v);
+      ctx.strokeStyle = GRID;
+      ctx.beginPath(); ctx.moveTo(mL, py); ctx.lineTo(W - mR, py); ctx.stroke();
+      ctx.fillStyle = "#1f5c8a";
+      ctx.fillText(v.toFixed(v < 10 ? 1 : 0), mL - 6, py + 3);
+    });
+  }
+  // eixo Y direito (NOx) - so rotulos
+  if (maxR !== null) {
+    ctx.textAlign = "left";
+    niceTicks(0, maxR, 6).forEach(v => {
+      ctx.fillStyle = "#6a3fb0";
+      ctx.fillText(v.toFixed(v < 10 ? 1 : 0), W - mR + 6, yR(v) + 3);
+    });
+  }
+
+  // moldura + titulos dos eixos
+  ctx.strokeStyle = AXIS;
+  ctx.strokeRect(mL, plotT, W - mR - mL, plotH);
+  ctx.fillStyle = "#1f5c8a"; ctx.textAlign = "left"; ctx.font = "bold 12px Segoe UI";
+  ctx.fillText("O2", mL + 2, plotT - 5);
+  if (maxR !== null) {
+    ctx.fillStyle = "#6a3fb0"; ctx.textAlign = "right";
+    ctx.fillText("NOx (ppm)", W - mR - 2, plotT - 5);
+  }
+
+  // series visiveis
+  SERIES.filter(s => s.on).forEach(s => {
+    const yf = s.axis === "L" ? yL : yR;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.dash ? 1.3 : 1.8;
+    ctx.setLineDash(s.dash || []);
+    ctx.beginPath();
+    let started = false;
+    for (const r of rows) {
+      const v = r[s.key];
+      if (!isFinite(v)) { started = false; continue; }
+      const px = x(r.t), py = yf(v);
+      if (started) ctx.lineTo(px, py); else { ctx.moveTo(px, py); started = true; }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  // eixo do tempo
+  ctx.fillStyle = TXT; ctx.font = "11px Segoe UI"; ctx.textAlign = "center";
+  niceTicks(d.tmin, d.tmax, 9).forEach(t => {
+    const px = x(t);
+    ctx.strokeStyle = GRID;
+    ctx.beginPath(); ctx.moveTo(px, plotT); ctx.lineTo(px, plotB); ctx.stroke();
+    ctx.fillText(fmtTime(t), px, plotB + 14);
+  });
+  ctx.fillText("tempo (s)", (mL + W - mR) / 2, H - 4);
+
+  if (mouseX !== null) drawCursor(x, yL, yR);
+}
+
+function drawCursor(x, yL, yR) {
+  const d = DATA, W = canvas.clientWidth, H = canvas.clientHeight;
+  const mL = 56, mR = 58, mT = 18;
+  const tt = d.tmin + (mouseX - mL) / ((W - mL - mR) || 1) * (d.tmax - d.tmin);
+  let lo = 0, hi = d.rows.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (d.rows[m].t < tt) lo = m + 1; else hi = m; }
+  if (lo > 0 && Math.abs(d.rows[lo - 1].t - tt) < Math.abs(d.rows[lo].t - tt)) lo--;
+  const r = d.rows[lo];
+  const px = x(r.t);
+  if (px < mL || px > W - mR) return;
+
+  ctx.strokeStyle = "#999"; ctx.setLineDash([4, 3]);
+  ctx.beginPath(); ctx.moveTo(px, mT); ctx.lineTo(px, H - 40); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // pontos das series visiveis
+  SERIES.filter(s => s.on && isFinite(r[s.key])).forEach(s => {
+    const yf = s.axis === "L" ? yL : yR;
+    ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(px, yf(r[s.key]), 3, 0, 7); ctx.fill();
+  });
+
+  const lines = [
+    `t = ${fmtTime(r.t)}  ${r.st === 1 ? "CORRIGINDO" : "bypass"} ${isFinite(r.ramp) ? "(" + r.ramp.toFixed(0) + "%)" : ""}`
+  ];
+  SERIES.filter(s => s.on).forEach(s =>
+    lines.push(`${s.label}: ${fmt(r[s.key])}`));
+
+  ctx.font = "12px Segoe UI";
+  const bw = 8 + Math.max(...lines.map(s => ctx.measureText(s).width)) + 6;
+  const bh = lines.length * 16 + 8;
+  let bx = px + 10; if (bx + bw > W - 4) bx = px - 10 - bw;
+  const by = mT + 6;
+  ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.strokeStyle = "#bbb";
+  ctx.fillRect(bx, by, bw, bh); ctx.strokeRect(bx, by, bw, bh);
+  ctx.textAlign = "left";
+  lines.forEach((s, i) => {
+    ctx.fillStyle = i === 0 ? "#222" : (SERIES.filter(x => x.on)[i - 1] || {}).color || "#222";
+    ctx.fillText(s, bx + 6, by + 18 + i * 16);
+  });
+}
+
+function fmt(v) { return isFinite(v) ? v.toFixed(2) : "—"; }
+function fmtTime(t) {
+  if (DATA && (DATA.tmax - DATA.tmin) > 120) {
+    const m = Math.floor(t / 60), s = Math.floor(t % 60);
+    return m + ":" + String(s).padStart(2, "0");
+  }
+  return t.toFixed(1);
+}
+</script>
+</body>
+</html>
