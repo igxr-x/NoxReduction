@@ -23,6 +23,16 @@ o ganho, o trigger, a rampa e o modo do D3 — tudo **gravado na EEPROM**
   **não baixar desse valor**. Em vez de virar uma linha reta, o alvo **oscila**
   um pouco acima do piso (padrão: período 2,5 s, amplitude 6 %). `Piso = 0`
   desliga esse reforço.
+- **Piso 2 (ciclo temporizado):** um **segundo piso, mais baixo**, que o alvo
+  passa a "bater" periodicamente **enquanto está corrigindo** (dentro do
+  trigger). O ciclo é: segura no **Piso 1** por **Y** (`Tempo Y`) → **desce em
+  rampa** até o **Piso 2** → conta **X** (`Tempo X`) **a partir do instante em
+  que atinge o Piso 2** → **sobe em rampa** de volta ao Piso 1 → recomeça, em
+  loop. A rampa entre os pisos reusa o mesmo `Rampa (ms)`. A **oscilação
+  senoidal pequena continua aplicada por cima** do piso que estiver ativo no
+  momento (Piso 1 ou Piso 2). Fora do trigger (bypass) o ciclo **pausa e volta
+  ao Piso 1**. `Piso 2 = 0` (ou `Piso 2 ≥ Piso 1`) **desliga o ciclo** — fica só
+  o Piso 1 de sempre. Exige `0 < Piso 2 < Piso 1`.
 - **Correção proporcional à faixa (modo alternativo):** quando ligada, o ganho
   vira **proporcional à posição do O2 lido dentro da faixa `[piso, trigger]`**:
   perto do **trigger** a correção é **mínima (0 %)**, perto do **piso** é
@@ -36,8 +46,14 @@ o ganho, o trigger, a rampa e o modo do D3 — tudo **gravado na EEPROM**
   não dar um salto brusco. `ramp_ms = 0` → troca instantânea.
 - **Pino D3 (override por hardware, `INPUT_PULLUP`):** quando D3 chega em nível
   **baixo/negativo** (ligado ao GND), o modo configurável decide:
-  **Bypass** (totalmente sem correção) ou **Corrigindo** (força a correção).
-  Com D3 solto (alto), vale o trigger de O2.
+  - **Bypass:** força **bypass total** — tudo que entra sai igual, sem correção,
+    ignorando o trigger enquanto D3 estiver baixo.
+  - **Corrigindo:** **não força nada** — apenas **segue o trigger de O2 normal**
+    (entra/sai do bypass pelo trigger), corrigindo **dentro do que foi
+    configurado** em vez de corrigir o tempo todo. Fica igual à operação
+    automática.
+
+  Com D3 solto (alto), vale sempre o trigger de O2.
 
 ```
 raw_out = raw0 + (raw_lido - raw0) * (1 + (±X% · k)/100)
@@ -74,9 +90,12 @@ configurado no app (Bypass ou Corrigindo).
 |---------------------|---------|-------------------------------------------------|
 | Ganho proporcional  | 0 %     | O2 `+X%`, NOx `−X%`                              |
 | Trigger O2          | 5       | corrige quando O2 (diag) `<` este valor         |
-| Piso O2             | 3       | O2 corrigido não baixa disso (oscila; 0 desliga)|
-| Rampa               | 2000 ms | tempo de 0 → 100 % ao entrar/sair do trigger    |
-| D3 negativo         | Bypass  | modo do D3 baixo: Bypass ou Corrigindo          |
+| Piso 1 O2           | 3       | O2 corrigido não baixa disso (oscila; 0 desliga)|
+| Piso 2 O2           | 0       | piso mais baixo do ciclo (0 ou ≥Piso 1 = desliga)|
+| Tempo X             | 5000 ms | quanto segura no Piso 2 (conta ao atingi-lo)    |
+| Tempo Y             | 60000 ms| intervalo no Piso 1 entre mergulhos ao Piso 2   |
+| Rampa               | 2000 ms | tempo de 0 → 100 % ao entrar/sair; e rampa entre pisos |
+| D3 negativo         | Bypass  | modo do D3 baixo: Bypass (força) ou Corrigindo (segue trigger) |
 | Correção            | Fixa    | Fixa (piso oscila) ou Proporcional à faixa      |
 
 A **calibração** raw → valor exibido é **fixa** (constantes no firmware e no
@@ -87,7 +106,125 @@ app), usada só para exibir o valor final e avaliar os triggers de O2:
 | 1 (NOx ppm)  | 4000      | 100 → 6000     |
 | 2 (O2)       | 23500     | 9.5 → 42000    |
 
-## 1. Firmware (PlatformIO)
+## Versão sem fio — LilyGO T-2CAN (ESP32-S3)
+
+Porta o **mesmo corretor** para a placa **LilyGO T-2CAN**, trocando a
+comunicação por **Wi-Fi + página web**: não precisa mais do cabo USB nem do
+app do PC para operar. A placa **cria a própria rede Wi-Fi** e serve uma página
+que mostra a telemetria ao vivo e ajusta todos os parâmetros (ganho, trigger,
+piso 1, **piso 2 + tempos X/Y do ciclo**, rampa, correção e D3), gravados na
+EEPROM.
+
+> A base da correção é a **mesma** do firmware do Arduino — mudaram a fiação CAN
+> e o meio de comunicação. Firmware novo: `firmware/src/t2can_main.cpp`.
+>
+> **Só a T-2CAN tem** o **ciclo de Piso 2** (tempos X/Y) e o **D3 "Corrigindo"
+> que segue o trigger** (o firmware serial do Nano e o `app.py` mantêm o
+> comportamento antigo: D3 "Corrigindo" força correção e não há Piso 2).
+
+### Diferença de hardware (importante)
+
+A T-2CAN **não** tem dois MCP2515 iguais. Ela tem **dois canais CAN diferentes**:
+
+| Canal | Controlador | Papel neste projeto | Liga em |
+|-------|-------------|---------------------|---------|
+| CAN A | **MCP2515** (SPI) | **Leitura** (corrige aqui) | lado do **sensor/ECU** |
+| CAN B | **TWAI** (CAN nativo do ESP32-S3) | **Saída** | lado do **diagnóstico** |
+
+O barramento continua **cortado em dois** — igual ao Nano. Só que agora um lado
+entra no conector CAN do **MCP2515** e o outro no conector do **CAN nativo**.
+
+Pinos usados pelo firmware (T-2CAN V1.0, **cristal do MCP2515 = 16 MHz**):
+`SPI SCLK=12 MOSI=11 MISO=13` · `MCP2515 CS=10 RST=9` · `TWAI TX=7 RX=6` ·
+`override físico = IO4` (deixe solto para operação normal).
+
+### Fiação do barramento (bornes da própria placa)
+
+O barramento continua **cortado em dois trechos** (igual ao Nano). Ligue cada
+trecho no borne parafusável correspondente:
+
+| Lado do barramento | Borne na T-2CAN | Canal interno | Papel     |
+|--------------------|-----------------|---------------|-----------|
+| **Sensor / ECU**   | **CANHA / CANLA** | CAN A = MCP2515 | Leitura (corrige aqui) |
+| **Diagnóstico**    | **CANHB / CANLB** | CAN B = TWAI    | Saída     |
+
+- `CANH↔CANH` e `CANL↔CANL` de cada lado; terra do CAN (opcional) no `SGND`.
+- **Alimentação:** USB-C **ou** o borne **DC 12–24 V** (pode puxar do veículo).
+- Se a correção sair "invertida", troque os dois chicotes de lado nos bornes.
+
+### Botão de override físico (o antigo D3) → **IO4**
+
+O override por hardware (força Bypass/Corrigindo) está no pad **`IO4`** da placa
+(`INPUT_PULLUP`, mesma lógica do D3 do Nano):
+
+```
+   [ interruptor de trava ]
+   IO4  ───o     o───  GND
+```
+
+- **Fechado (IO4 no GND):** ativa o modo configurado no campo **"D3 negativo"**
+  da página web (padrão de fábrica = **Bypass**).
+- **Aberto (solto):** volta ao **trigger automático de O2**.
+- Use um **interruptor de trava / chave gangorra** (fica ligado). Um botão de
+  pressão momentâneo só forçaria o modo enquanto ficasse apertado.
+
+### Como usar (depois de gravar)
+
+1. Ligue a T-2CAN (USB-C ou 12–24 V no conector DC).
+2. No celular/notebook, conecte no Wi-Fi **`Starlink Labs`** — senha **`11021992`**.
+3. Abra **`http://192.168.4.1`** no navegador.
+4. A página mostra **BYPASS / CORRIGINDO**, os valores **Lido × Corrigido** de
+   O2 e NOx (com gráfico ao vivo) e todos os campos de configuração. Ajuste e
+   clique **Aplicar** — grava na EEPROM na hora.
+5. **Gravar log** salva um `.csv` (mesmas colunas de antes) direto no aparelho,
+   que você abre no `log_viewer.html`.
+
+> O SSID/senha ficam no topo do `t2can_main.cpp` (`AP_SSID` / `AP_PASS`) — a
+> senha precisa ter no mínimo 8 caracteres.
+
+### Gravar a T-2CAN pelo PlatformIO (passo a passo, sem experiência com ESP32)
+
+É o **mesmo PlatformIO** que você já usava com o Arduino — só muda o *env*.
+
+1. **Instale o PlatformIO Core** (uma vez só), se ainda não tiver:
+   - Com Python: `pip install platformio` → o comando `pio` fica disponível no
+     terminal. (Ou instale a extensão **PlatformIO IDE** no VS Code.)
+   - Confira: `pio --version`.
+2. **Conecte a T-2CAN no PC pelo cabo USB-C.** Ela usa **USB nativo** do ESP32-S3
+   e aparece como uma porta **COM** nova (veja em Gerenciador de Dispositivos).
+   Use um cabo USB-C **de dados** (alguns cabos são só de carga e não funcionam).
+3. **Grave** (dentro da pasta do projeto):
+
+   ```bash
+   pio run -e t2can -t upload                 # compila e grava (env t2can e' o padrao)
+   pio run -e t2can -t upload --upload-port COM7   # forca a porta, se preciso
+   ```
+
+   Na **primeira gravação**, o Windows baixa o toolchain do ESP32-S3 (demora um
+   pouco só na primeira vez).
+4. **Se travar em `Connecting...`:** ponha o S3 em modo de gravação manualmente —
+   **segure o botão BOOT (GPIO0)**, **toque RESET**, **solte o BOOT** e rode o
+   upload de novo.
+5. **Ver o Wi-Fi/IP ao ligar (opcional):** `pio device monitor -e t2can`
+   imprime `Wi-Fi AP "BridgeCAN" ... -> http://192.168.4.1`. (Só para conferir;
+   a operação normal é toda pela página web, sem cabo.)
+
+Ou use o atalho **`gravar_t2can.bat`** (duplo-clique ou por CMD), que
+auto-detecta a porta e dá as dicas de recuperação:
+
+```bat
+gravar_t2can.bat          :: auto-detecta a porta
+gravar_t2can.bat COM7     :: forca a porta
+```
+
+> **`ERRO MCP2515`** no monitor serial → confira a fiação do lado da leitura e
+> que o cristal é de **16 MHz** (se por acaso for 8 MHz, troque `MCP_16MHZ` por
+> `MCP_8MHZ` em `t2can_main.cpp`). **`ERRO TWAI`** → confira o lado do
+> diagnóstico (TX=7/RX=6) e o bitrate 250 kbps.
+
+---
+
+## 1. Firmware do Arduino Nano / ESP32-C3 (PlatformIO)
 
 Projeto em `firmware/`. As libs (`mcp_can`, `EEPROM`) são resolvidas
 automaticamente. Dentro da pasta `firmware/`:
@@ -165,8 +302,9 @@ escrita) — o log é gravado **no PC** enquanto o app está conectado.
 O visualizador mostra **tudo num único gráfico de eixo duplo** (O2 na escala da
 esquerda, NOx ppm na direita), na mesma linha do tempo:
 
-- **O2:** lido × corrigido, com as linhas do **trigger** (tracejada) e do
-  **piso** (pontilhada);
+- **O2:** lido × corrigido, com as linhas de referência do **trigger**
+  (tracejada laranja), do **piso 1** (pontilhada vermelha) e do **piso 2**
+  (pontilhada magenta) — são só referência do que você configurou;
 - **NOx (ppm):** lido × corrigido;
 - **faixas verdes** marcam os trechos em que o trigger estava ativo
   (**CORRIGINDO**); passe o mouse para ler os valores em cada instante.
@@ -175,8 +313,10 @@ Cada linha tem uma **caixa de seleção** no topo para mostrar/ocultar
 individualmente (O2 lido, O2 corrigido, trigger, piso, NOx lido, NOx corrigido).
 
 Colunas do CSV: `t_s, o2_read, o2_corr, nox_read, nox_corr, o2_trigger,
-o2_floor, state, ramp_pct` (`state`: 0=bypass, 1=corrigindo; `t_s` em segundos
-desde o início da gravação).
+o2_floor, o2_floor2, state, ramp_pct` (`state`: 0=bypass, 1=corrigindo; `t_s`
+em segundos desde o início da gravação). A coluna `o2_floor2` (Piso 2) só
+aparece nos logs gerados pela T-2CAN; o visualizador ignora colunas ausentes,
+então logs antigos continuam abrindo normalmente.
 
 ## Protocolo serial
 
@@ -186,9 +326,13 @@ desde o início da gravação).
   - `TRG:<v>` — limite de O2 do trigger (grava EEPROM).
   - `FLR:<v>` — piso de O2 / valor mínimo de saída (grava EEPROM).
   - `RMP:<v>` — tempo de rampa em milissegundos (grava EEPROM).
-  - `D3:<0|1>` — modo do D3 baixo (`1`=Bypass, `0`=Corrigindo).
+  - `D3:<0|1>` — modo do D3 baixo (`1`=Bypass força, `0`=Corrigindo segue trigger).
   - `PRP:<0|1>` — correção proporcional à faixa (`1`=on, `0`=piso oscila).
+  - `FL2:<v>` — Piso 2 de O2 (piso mais baixo do ciclo; `0` desliga) — só T-2CAN.
+  - `HLD:<ms>` — Tempo X: quanto segura no Piso 2 — só T-2CAN.
+  - `PER:<ms>` — Tempo Y: intervalo no Piso 1 entre mergulhos — só T-2CAN.
 - Nano → PC:
-  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band` — config atual.
+  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band[,o2_floor2,hold_ms,period_ms]`
+    — config atual (os 3 últimos campos só aparecem no firmware T-2CAN).
   - `T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos>` —
     telemetria (~10 Hz); `estado`: 0=BYPASS 1=CORRIGINDO, `k`: 0..1000.

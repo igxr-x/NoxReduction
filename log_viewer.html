@@ -51,7 +51,8 @@ const SERIES = [
   { key: "o2r", label: "O2 lido",       color: "#1f77b4", axis: "L", on: true },
   { key: "o2c", label: "O2 corrigido",  color: "#0a7d2c", axis: "L", on: true },
   { key: "trg", label: "trigger O2",    color: "#e08a00", axis: "L", dash: [7, 5], on: true },
-  { key: "flr", label: "piso O2",       color: "#c02020", axis: "L", dash: [2, 4], on: true },
+  { key: "flr", label: "piso 1 O2",     color: "#c02020", axis: "L", dash: [2, 4], on: true },
+  { key: "flr2", label: "piso 2 O2",    color: "#c000c0", axis: "L", dash: [2, 4], on: true },
   { key: "nr",  label: "NOx lido",      color: "#9467bd", axis: "R", on: true },
   { key: "nc",  label: "NOx corrigido", color: "#17a2b8", axis: "R", on: true }
 ];
@@ -119,7 +120,7 @@ function parseCSV(text) {
   const idx = {
     t: col("t_s"), o2r: col("o2_read"), o2c: col("o2_corr"),
     nr: col("nox_read"), nc: col("nox_corr"),
-    trg: col("o2_trigger"), flr: col("o2_floor"),
+    trg: col("o2_trigger"), flr: col("o2_floor"), flr2: col("o2_floor2"),
     st: col("state"), ramp: col("ramp_pct")
   };
   const rows = [];
@@ -131,7 +132,7 @@ function parseCSV(text) {
     rows.push({
       t, o2r: num(idx.o2r), o2c: num(idx.o2c),
       nr: num(idx.nr), nc: num(idx.nc),
-      trg: num(idx.trg), flr: num(idx.flr),
+      trg: num(idx.trg), flr: num(idx.flr), flr2: num(idx.flr2),
       st: num(idx.st) | 0, ramp: num(idx.ramp)
     });
   }
