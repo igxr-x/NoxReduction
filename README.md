@@ -118,9 +118,11 @@ EEPROM.
 > A base da correção é a **mesma** do firmware do Arduino — mudaram a fiação CAN
 > e o meio de comunicação. Firmware novo: `firmware/src/t2can_main.cpp`.
 >
-> **Só a T-2CAN tem** o **ciclo de Piso 2** (tempos X/Y) e o **D3 "Corrigindo"
-> que segue o trigger** (o firmware serial do Nano e o `app.py` mantêm o
-> comportamento antigo: D3 "Corrigindo" força correção e não há Piso 2).
+> O **ciclo de Piso 2** (tempos X/Y) agora existe **nas duas versões** — Nano
+> (`firmware/src/main.cpp` + `app.py`) **e** T-2CAN. A **única** diferença de
+> comportamento que resta é o **D3 "Corrigindo"**: na T-2CAN ele **segue o
+> trigger de O2**; no firmware serial do Nano ele mantém o comportamento antigo
+> (**força a correção** enquanto D3 estiver baixo).
 
 ### Diferença de hardware (importante)
 
@@ -281,8 +283,10 @@ python app.py
 2. Selecione a porta COM do Nano e clique **Conectar** (o app pede a config).
 3. O painel mostra ao vivo o valor final **Lido** e **Corrigido** do O2 e do NOx,
    e um status grande **BYPASS / CORRIGINDO** (com o % da rampa em transição).
-4. Ajuste **Ganho / Trigger O2 / Piso O2 / Rampa (ms)** e clique **Aplicar**.
-   Se o piso ficar acima do trigger, o app avisa com um alerta.
+4. Ajuste **Ganho / Trigger O2 / Piso 1 / Piso 2 / Tempo X / Tempo Y / Rampa
+   (ms)** e clique **Aplicar** (cada botão grava aquele campo na EEPROM). Se o
+   Piso 1 ficar acima do trigger, ou o Piso 2 ficar ≥ Piso 1, o app avisa com um
+   alerta. **Piso 2 = 0** desliga o ciclo temporizado (fica só o Piso 1).
 5. Em **Correção**, escolha **Fixa (piso oscila)** ou **Proporcional à faixa**
    e clique **Aplicar**.
 6. Escolha o modo do **D3 negativo** (Bypass ou Corrigindo) e clique **Aplicar**.
@@ -314,9 +318,9 @@ individualmente (O2 lido, O2 corrigido, trigger, piso, NOx lido, NOx corrigido).
 
 Colunas do CSV: `t_s, o2_read, o2_corr, nox_read, nox_corr, o2_trigger,
 o2_floor, o2_floor2, state, ramp_pct` (`state`: 0=bypass, 1=corrigindo; `t_s`
-em segundos desde o início da gravação). A coluna `o2_floor2` (Piso 2) só
-aparece nos logs gerados pela T-2CAN; o visualizador ignora colunas ausentes,
-então logs antigos continuam abrindo normalmente.
+em segundos desde o início da gravação). A coluna `o2_floor2` (Piso 2) agora é
+gravada tanto pelo `app.py` quanto pela T-2CAN; o visualizador ignora colunas
+ausentes, então logs antigos (sem `o2_floor2`) continuam abrindo normalmente.
 
 ## Protocolo serial
 
@@ -324,15 +328,17 @@ então logs antigos continuam abrindo normalmente.
   - `GET` — pede a config atual.
   - `PCT:<v>` — ganho proporcional único (grava EEPROM).
   - `TRG:<v>` — limite de O2 do trigger (grava EEPROM).
-  - `FLR:<v>` — piso de O2 / valor mínimo de saída (grava EEPROM).
+  - `FLR:<v>` — Piso 1 de O2 / valor mínimo de saída (grava EEPROM).
   - `RMP:<v>` — tempo de rampa em milissegundos (grava EEPROM).
-  - `D3:<0|1>` — modo do D3 baixo (`1`=Bypass força, `0`=Corrigindo segue trigger).
+  - `D3:<0|1>` — modo do D3 baixo (`1`=Bypass força; `0`=Corrigindo — no Nano
+    serial força a correção, na T-2CAN segue o trigger).
   - `PRP:<0|1>` — correção proporcional à faixa (`1`=on, `0`=piso oscila).
-  - `FL2:<v>` — Piso 2 de O2 (piso mais baixo do ciclo; `0` desliga) — só T-2CAN.
-  - `HLD:<ms>` — Tempo X: quanto segura no Piso 2 — só T-2CAN.
-  - `PER:<ms>` — Tempo Y: intervalo no Piso 1 entre mergulhos — só T-2CAN.
+  - `FL2:<v>` — Piso 2 de O2 (piso mais baixo do ciclo; `0` desliga).
+  - `HLD:<ms>` — Tempo X: quanto segura no Piso 2.
+  - `PER:<ms>` — Tempo Y: intervalo no Piso 1 entre mergulhos.
 - Nano → PC:
-  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band[,o2_floor2,hold_ms,period_ms]`
-    — config atual (os 3 últimos campos só aparecem no firmware T-2CAN).
+  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms`
+    — config atual (9 campos no firmware atual do Nano e da T-2CAN; firmwares
+    antigos do Nano mandavam só os 6 primeiros).
   - `T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos>` —
     telemetria (~10 Hz); `estado`: 0=BYPASS 1=CORRIGINDO, `k`: 0..1000.

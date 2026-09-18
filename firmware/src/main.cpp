@@ -59,17 +59,29 @@
  *
  * Persistencia: config na EEPROM (sobrevive a desligar o Nano).
  *
+ * CICLO DE PISO (Piso 2, oscilacao lenta no tempo):
+ *   Alem do Piso 1 (o2_floor), existe um Piso 2 (o2_floor2) MAIS BAIXO. Quando
+ *   esta corrigindo e 0 < Piso2 < Piso1, o piso em vigor (activeFloor) oscila
+ *   no tempo: segura no Piso 1 por Y ms (floor_period_ms), desce em rampa ate'
+ *   o Piso 2, segura la por X ms (floor_hold_ms) e volta ao Piso 1. Fora do
+ *   trigger (bypass) o ciclo pausa e volta ao Piso 1. A senoide pequena do piso
+ *   (OSC_*) continua sendo aplicada POR CIMA de activeFloor. Piso2 = 0 desliga
+ *   o ciclo (fica so no Piso 1, comportamento antigo).
+ *
  * Protocolo serial (115200):
  *   PC -> Nano:
  *     GET            pede a config atual
  *     PCT:<v>        ganho proporcional unico (ex.: PCT:20)
  *     TRG:<v>        limite de O2 do trigger (diag)
- *     FLR:<v>        piso de O2 (valor minimo de saida)
+ *     FLR:<v>        piso 1 de O2 (valor minimo de saida)
  *     RMP:<v>        tempo de rampa em milissegundos
  *     D3:<0|1>       modo do D3 baixo (0=corrige, 1=bypass)
  *     PRP:<0|1>      correcao proporcional a faixa (1=on, 0=piso oscila)
+ *     FL2:<v>        piso 2 de O2 (mais baixo; 0 = sem ciclo)
+ *     HLD:<v>        tempo X: quanto segura no Piso 2 (ms)
+ *     PER:<v>        tempo Y: quanto segura no Piso 1 entre mergulhos (ms)
  *   Nano -> PC:
- *     CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band
+ *     CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms
  *     T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos>
  *        estado: 0=BYPASS 1=CORRIGINDO ; k_milesimos: 0..1000
  */
@@ -99,7 +111,7 @@
 
 const uint32_t TARGET_ID  = 0x18F00F52;  // frame a corrigir (estendido)
 const uint16_t TELEM_MS   = 100;         // periodo da telemetria
-const uint32_t CFG_MAGIC  = 0x43414E36;  // "CAN6" - marca de EEPROM valida
+const uint32_t CFG_MAGIC  = 0x43414E37;  // "CAN7" - marca de EEPROM valida (cresceu: piso 2 + X/Y)
 
 // ---- Calibracao FIXA raw -> diag (raw0, dref, rref) ----
 const float NOX_RAW0 = 4000.0f,  NOX_DREF = 100.0f, NOX_RREF = 6000.0f;   // NOx
@@ -121,6 +133,9 @@ struct Config {
   uint32_t ramp_ms;        // tempo de rampa (ms) de 0 a 100%
   uint8_t  d3_low_bypass;  // 1: D3 baixo -> bypass ; 0: D3 baixo -> corrige
   uint8_t  prop_band;      // 1: ganho proporcional a faixa [piso, trigger]
+  float    o2_floor2;      // Piso 2: piso mais baixo, atingido no ciclo (0 = desliga)
+  uint32_t floor_hold_ms;  // tempo X: quanto segura no Piso 2 (conta ao atingi-lo)
+  uint32_t floor_period_ms;// tempo Y: quanto segura no Piso 1 entre mergulhos
 };
 
 Config cfg;
@@ -133,6 +148,13 @@ float k = 0.0f;               // fator de rampa 0..1
 bool correctActive = false;   // alvo atual (trigger/D3): corrigindo?
 unsigned long lastTelem = 0;
 unsigned long lastRamp = 0;
+
+// Ciclo do Piso 2 (Piso1 <-> Piso2 no tempo, so quando corrigindo)
+enum FloorPhase { FP_HOLD1, FP_DOWN, FP_HOLD2, FP_UP };
+uint8_t floorPhase = FP_HOLD1;
+float activeFloor = 0.0f;            // piso em vigor no instante (o que o reforco usa)
+unsigned long floorPhaseT0 = 0;      // inicio da fase atual (p/ contar X e Y)
+unsigned long lastFloorMs = 0;
 
 // Buffer serial
 char rxBuf[48];
@@ -148,6 +170,7 @@ void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection);
 uint16_t correct(uint16_t raw, float raw0, float signedPct);
 float rawToDiag(uint16_t raw, float raw0, float dref, float rref);
 void updateRamp();
+void updateFloorCycle();
 
 void setup() {
   Serial.begin(115200);
@@ -175,12 +198,15 @@ void setup() {
   CAN_SEND.setMode(MCP_NORMAL);
 
   lastRamp = millis();
+  lastFloorMs = floorPhaseT0 = millis();
+  activeFloor = cfg.o2_floor;
   Serial.println(F("PRONTO: bridge CAN 250kbps ativo (CS10=leitura CS9=saida)"));
   sendConfig();
 }
 
 void loop() {
   updateRamp();
+  updateFloorCycle();
 
   // Sensor -> Diagnostico (corrige o TARGET_ID)
   pumpBus(CAN_READ, CAN_SEND, true);
@@ -228,6 +254,63 @@ void updateRamp() {
   }
 }
 
+// Ciclo do Piso 2: enquanto esta corrigindo (dentro do trigger) e o Piso 2 for
+// valido (0 < piso2 < piso1), o piso em vigor (activeFloor) oscila NO TEMPO:
+//   HOLD1 -> segura no Piso 1 por Y (floor_period_ms)
+//   DOWN  -> desce em rampa ate o Piso 2
+//   HOLD2 -> segura no Piso 2 por X (floor_hold_ms; conta a partir de atingi-lo)
+//   UP    -> sobe em rampa de volta ao Piso 1 -> recomeca (HOLD1)
+// Fora do trigger (bypass) o ciclo pausa/zera: volta pro Piso 1. A rampa entre
+// pisos reusa o mesmo tempo de rampa (ramp_ms). A oscilacao senoidal pequena do
+// piso continua sendo aplicada POR CIMA de activeFloor (em pumpBus).
+void updateFloorCycle() {
+  unsigned long now = millis();
+  unsigned long dt = now - lastFloorMs;
+  lastFloorMs = now;
+
+  float piso1 = cfg.o2_floor;
+  float piso2 = cfg.o2_floor2;
+  bool cycleOn = correctActive && piso1 > 0.0f && piso2 > 0.0f && piso2 < piso1;
+
+  if (!cycleOn) {                 // sem ciclo: fica no Piso 1 (comportamento antigo)
+    floorPhase = FP_HOLD1;
+    floorPhaseT0 = now;
+    activeFloor = piso1;
+    return;
+  }
+
+  // passo da rampa do piso (unidades de O2/ms); ramp_ms==0 -> transicao instantanea
+  float step = (cfg.ramp_ms == 0) ? 1e9f
+             : (piso1 - piso2) * (float)dt / (float)cfg.ramp_ms;
+
+  switch (floorPhase) {
+    case FP_HOLD1:
+      activeFloor = piso1;
+      if (now - floorPhaseT0 >= cfg.floor_period_ms) floorPhase = FP_DOWN;  // passou Y
+      break;
+    case FP_DOWN:
+      activeFloor -= step;
+      if (activeFloor <= piso2) {              // atingiu o Piso 2
+        activeFloor = piso2;
+        floorPhase = FP_HOLD2;
+        floorPhaseT0 = now;                    // X so comeca a contar agora
+      }
+      break;
+    case FP_HOLD2:
+      activeFloor = piso2;
+      if (now - floorPhaseT0 >= cfg.floor_hold_ms) floorPhase = FP_UP;      // passou X
+      break;
+    case FP_UP:
+      activeFloor += step;
+      if (activeFloor >= piso1) {              // voltou ao Piso 1
+        activeFloor = piso1;
+        floorPhase = FP_HOLD1;
+        floorPhaseT0 = now;                    // recomeca Y
+      }
+      break;
+  }
+}
+
 // Le todos os frames de "in" e repassa para "out". Se applyCorrection e o
 // frame for o TARGET_ID, aplica a correcao antes de reenviar.
 void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection) {
@@ -257,13 +340,14 @@ void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection) {
       }
 
       // Reforco do piso (com oscilacao): vale nos DOIS modos. Sobe o ganho
-      // para o O2 corrigido NAO baixar do piso, com o alvo oscilando um
-      // pouco acima dele - inclusive quando a escala proporcional deixaria
-      // o ganho baixo demais perto do trigger.
-      if (cfg.o2_floor > 0.0f && o2d > 0.01f) {
+      // para o O2 corrigido NAO baixar do piso EM VIGOR (activeFloor, que o
+      // ciclo do Piso 2 move no tempo), com o alvo oscilando um pouco acima
+      // dele - inclusive quando a escala proporcional deixaria o ganho baixo
+      // demais perto do trigger.
+      if (activeFloor > 0.0f && o2d > 0.01f) {
         float ph  = (float)(millis() % OSC_PERIOD_MS) / (float)OSC_PERIOD_MS;
-        float osc = 0.5f + 0.5f * sin(TWO_PI_F * ph);          // 0..1
-        float tgt = cfg.o2_floor * (1.0f + OSC_AMP_FRAC * osc); // piso..piso+6%
+        float osc = 0.5f + 0.5f * sin(TWO_PI_F * ph);            // 0..1
+        float tgt = activeFloor * (1.0f + OSC_AMP_FRAC * osc);   // piso..piso+6%
         float gNeeded = 100.0f * (tgt / o2d - 1.0f);
         if (gNeeded > g) g = gNeeded;         // reforca para nao baixar do piso
       }
@@ -306,6 +390,9 @@ void loadConfig() {
     cfg.ramp_ms       = 2000;   // 2 s de rampa
     cfg.d3_low_bypass = 1;      // D3 baixo -> bypass
     cfg.prop_band     = 0;      // 0 = piso oscila ; 1 = proporcional a faixa
+    cfg.o2_floor2       = 0;    // Piso 2 desligado por padrao (ciclo inativo)
+    cfg.floor_hold_ms   = 5000; // X: 5 s no Piso 2
+    cfg.floor_period_ms = 60000;// Y: 60 s no Piso 1 entre mergulhos
     saveConfig();
   }
 }
@@ -324,7 +411,10 @@ void sendConfig() {
   Serial.print(cfg.o2_floor, 3);   Serial.print(',');
   Serial.print(cfg.ramp_ms);       Serial.print(',');
   Serial.print(cfg.d3_low_bypass); Serial.print(',');
-  Serial.println(cfg.prop_band);
+  Serial.print(cfg.prop_band);       Serial.print(',');
+  Serial.print(cfg.o2_floor2, 3);    Serial.print(',');
+  Serial.print(cfg.floor_hold_ms);   Serial.print(',');
+  Serial.println(cfg.floor_period_ms);
 }
 
 // ---- Comandos serial ----
@@ -354,4 +444,7 @@ void handleLine(char *line) {
   if (strncmp(line, "RMP:", 4) == 0) { cfg.ramp_ms    = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
   if (strncmp(line, "D3:", 3) == 0)  { cfg.d3_low_bypass = (atoi(line + 3) != 0) ? 1 : 0; saveConfig(); sendConfig(); return; }
   if (strncmp(line, "PRP:", 4) == 0) { cfg.prop_band     = (atoi(line + 4) != 0) ? 1 : 0; saveConfig(); sendConfig(); return; }
+  if (strncmp(line, "FL2:", 4) == 0) { cfg.o2_floor2       = atof(line + 4); saveConfig(); sendConfig(); return; }
+  if (strncmp(line, "HLD:", 4) == 0) { cfg.floor_hold_ms   = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
+  if (strncmp(line, "PER:", 4) == 0) { cfg.floor_period_ms = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
 }

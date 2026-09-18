@@ -66,7 +66,7 @@ class App:
         self.log_path = ""
 
         root.title("Bridge CAN 18F00F52 - corretor de sensores")
-        root.geometry("560x510")
+        root.geometry("560x630")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -120,8 +120,20 @@ class App:
             self.apply_trg)
 
         self.e_flr = self._cfg_row(
-            cfg, "Piso O2 (nao baixar de):", "3", "  (0 = desliga; oscila)",
+            cfg, "Piso 1 O2 (nao baixar de):", "3", "  (0 = desliga; oscila)",
             self.apply_flr)
+
+        self.e_flr2 = self._cfg_row(
+            cfg, "Piso 2 O2 (mais baixo):", "0", "  (0 = sem ciclo)",
+            self.apply_flr2)
+
+        self.e_hld = self._cfg_row(
+            cfg, "Tempo X (segura no Piso 2):", "5000", "ms",
+            lambda: self.send(f"HLD:{int(to_float(self.e_hld.get()))}"))
+
+        self.e_per = self._cfg_row(
+            cfg, "Tempo Y (segura no Piso 1):", "60000", "ms   (entre mergulhos)",
+            lambda: self.send(f"PER:{int(to_float(self.e_per.get()))}"))
 
         self.e_rmp = self._cfg_row(
             cfg, "Rampa:", "2000", "ms   (suaviza entra/sai do trigger)",
@@ -185,6 +197,10 @@ class App:
         self.send(f"FLR:{to_float(self.e_flr.get()):g}")
         self.check_band()
 
+    def apply_flr2(self):
+        self.send(f"FL2:{to_float(self.e_flr2.get()):g}")
+        self.check_band()
+
     def apply_prop(self):
         # Proporcional a faixa = 1, Fixa = 0
         on = self.prop_mode.get().startswith("Prop")
@@ -193,14 +209,21 @@ class App:
             self.check_band()
 
     def check_band(self):
-        # Alerta simples: piso nao pode ficar acima do trigger (faixa invalida).
+        # Alertas simples de faixa: Piso 1 nao pode ficar acima do trigger, e o
+        # Piso 2 (quando ligado) precisa ser MENOR que o Piso 1 para o ciclo valer.
         trg = to_float(self.e_trg.get())
         flr = to_float(self.e_flr.get())
+        flr2 = to_float(self.e_flr2.get())
         if flr > 0 and flr > trg:
             messagebox.showwarning(
                 "Piso acima do trigger",
-                f"O piso de O2 ({flr:g}) esta MAIOR que o trigger ({trg:g}).\n"
-                "A faixa de correcao fica invalida - ajuste para piso < trigger.")
+                f"O Piso 1 de O2 ({flr:g}) esta MAIOR que o trigger ({trg:g}).\n"
+                "A faixa de correcao fica invalida - ajuste para Piso 1 < trigger.")
+        elif flr2 > 0 and flr2 >= flr:
+            messagebox.showwarning(
+                "Piso 2 acima do Piso 1",
+                f"O Piso 2 ({flr2:g}) deve ser MENOR que o Piso 1 ({flr:g}).\n"
+                "O ciclo de piso so vale com Piso 2 < Piso 1.")
 
     # ---- log CSV ----
     def toggle_log(self):
@@ -221,7 +244,7 @@ class App:
             self.logf = None
             return
         self.logf.write("t_s,o2_read,o2_corr,nox_read,nox_corr,"
-                        "o2_trigger,o2_floor,state,ramp_pct\n")
+                        "o2_trigger,o2_floor,o2_floor2,state,ramp_pct\n")
         self.log_t0 = time.perf_counter()
         self.log_n = 0
         self.log_path = path
@@ -249,9 +272,10 @@ class App:
         t = time.perf_counter() - self.log_t0
         trg = to_float(self.e_trg.get())
         flr = to_float(self.e_flr.get())
+        flr2 = to_float(self.e_flr2.get())
         try:
             self.logf.write(f"{t:.3f},{o2r:.3f},{o2c:.3f},{nr:.3f},{nc:.3f},"
-                            f"{trg:g},{flr:g},{st},{kmil / 10:.1f}\n")
+                            f"{trg:g},{flr:g},{flr2:g},{st},{kmil / 10:.1f}\n")
         except OSError:
             self.stop_log()
             return
@@ -367,6 +391,10 @@ class App:
                 self.d3_mode.current(0 if int(v[4]) else 1)  # 1=Bypass, 0=Corrigindo
                 if len(parts) >= 6:
                     self.prop_mode.current(1 if int(v[5]) else 0)
+                if len(parts) >= 9:
+                    self._set(self.e_flr2, v[6])
+                    self._set(self.e_hld, int(v[7]))
+                    self._set(self.e_per, int(v[8]))
 
     def _set(self, entry, val):
         entry.delete(0, "end")
