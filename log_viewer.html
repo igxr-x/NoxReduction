@@ -39,7 +39,9 @@
 <div id="wrap">
   <canvas id="c"></canvas>
   <div class="hint">Eixo esquerdo = <b>O2</b> · eixo direito = <b>NOx (ppm)</b>.
-    Faixas verdes = <b>CORRIGINDO</b>. Use as caixas acima para mostrar/ocultar cada linha.
+    Faixas verdes = <b>CORRIGINDO</b>. Linhas verticais = eventos:
+    <b style="color:#e01010">furou piso 1</b> · <b style="color:#1f77b4">BOLINHAS</b> ·
+    <b style="color:#e08a00">RESET</b>. Use as caixas acima para mostrar/ocultar.
     Passe o mouse para ver os valores.</div>
 </div>
 
@@ -53,8 +55,15 @@ const SERIES = [
   { key: "trg", label: "trigger O2",    color: "#e08a00", axis: "L", dash: [7, 5], on: true },
   { key: "flr", label: "piso 1 O2",     color: "#c02020", axis: "L", dash: [2, 4], on: true },
   { key: "flr2", label: "piso 2 O2",    color: "#c000c0", axis: "L", dash: [2, 4], on: true },
+  { key: "af",  label: "piso em vigor", color: "#7a4fd0", axis: "L", on: true },
   { key: "nr",  label: "NOx lido",      color: "#9467bd", axis: "R", on: true },
   { key: "nc",  label: "NOx corrigido", color: "#17a2b8", axis: "R", on: true }
+];
+// eventos marcados como linhas verticais na linha do tempo
+const EVENTS = [
+  { key: "furou", label: "furou piso 1", color: "#e01010", on: true },
+  { key: "bol",   label: "BOLINHAS",     color: "#1f77b4", on: true },
+  { key: "rst",   label: "RESET",        color: "#e08a00", on: true }
 ];
 const BAND = "rgba(10,125,44,0.10)", GRID = "#eee", AXIS = "#999", TXT = "#444";
 
@@ -90,6 +99,20 @@ function buildControls() {
   const g2 = document.createElement("span"); g2.className = "grpname"; g2.textContent = "NOx:";
   box.appendChild(g2);
   SERIES.filter(s => s.axis === "R").forEach(mk);
+  const sep2 = document.createElement("span"); sep2.className = "sep"; box.appendChild(sep2);
+  const g3 = document.createElement("span"); g3.className = "grpname"; g3.textContent = "eventos:";
+  box.appendChild(g3);
+  EVENTS.forEach(e => {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = e.on;
+    cb.addEventListener("change", () => { e.on = cb.checked; draw(); });
+    const sw = document.createElement("span");
+    sw.className = "sw"; sw.style.width = "3px"; sw.style.height = "14px";
+    sw.style.background = e.color;
+    lab.append(cb, sw, document.createTextNode(e.label));
+    box.appendChild(lab);
+  });
 }
 
 // ---------- carregamento ----------
@@ -121,19 +144,32 @@ function parseCSV(text) {
     t: col("t_s"), o2r: col("o2_read"), o2c: col("o2_corr"),
     nr: col("nox_read"), nc: col("nox_corr"),
     trg: col("o2_trigger"), flr: col("o2_floor"), flr2: col("o2_floor2"),
-    st: col("state"), ramp: col("ramp_pct")
+    st: col("state"), ramp: col("ramp_pct"),
+    af: col("active_floor"), phase: col("phase"), remain: col("phase_remain_s"),
+    hld: col("hold_ms"), per: col("period_ms"),
+    bite: col("bite_count"), pierce: col("pierce_count"),
+    blocked: col("blocked"), bol: col("bolinhas"), rst: col("reset")
   };
   const rows = [];
+  let prevPierce = NaN;
   for (let i = 1; i < lines.length; i++) {
     const p = lines[i].split(",");
     const num = j => (j >= 0 && j < p.length) ? parseFloat(p[j]) : NaN;
     const t = num(idx.t);
     if (!isFinite(t)) continue;
+    const pierce = num(idx.pierce);
+    // "furou" = a contagem de furadas subiu nesta amostra (logs antigos: sempre falso)
+    const furou = isFinite(pierce) && isFinite(prevPierce) && pierce > prevPierce;
+    if (isFinite(pierce)) prevPierce = pierce;
     rows.push({
       t, o2r: num(idx.o2r), o2c: num(idx.o2c),
       nr: num(idx.nr), nc: num(idx.nc),
       trg: num(idx.trg), flr: num(idx.flr), flr2: num(idx.flr2),
-      st: num(idx.st) | 0, ramp: num(idx.ramp)
+      st: num(idx.st) | 0, ramp: num(idx.ramp),
+      af: num(idx.af), phase: num(idx.phase), remain: num(idx.remain),
+      bite: num(idx.bite), pierce,
+      blocked: (num(idx.blocked) | 0) === 1,
+      furou, bol: (num(idx.bol) | 0) === 1, rst: (num(idx.rst) | 0) === 1
     });
   }
   if (!rows.length) return null;
@@ -145,8 +181,13 @@ function showInfo(name) {
   const dur = (d.tmax - d.tmin).toFixed(1);
   const on = d.rows.filter(r => r.st === 1).length;
   const pct = (100 * on / d.rows.length).toFixed(0);
+  const furos = d.rows.filter(r => r.furou).length;
+  const bolinhas = d.rows.filter(r => r.bol).length;
+  const resets = d.rows.filter(r => r.rst).length;
   info.innerHTML = `<b>${name}</b> — ${d.rows.length} amostras · ${dur}s · ` +
-                   `${pct}% do tempo corrigindo`;
+                   `${pct}% do tempo corrigindo · <b>${furos}</b> furada(s) no piso 1` +
+                   (bolinhas ? ` · ${bolinhas} BOLINHAS` : "") +
+                   (resets ? ` · ${resets} RESET` : "");
 }
 
 // ---------- desenho ----------
@@ -258,6 +299,17 @@ function draw() {
     ctx.setLineDash([]);
   });
 
+  // marcas verticais dos eventos (furou piso 1 / BOLINHAS / RESET)
+  EVENTS.filter(e => e.on).forEach(e => {
+    ctx.strokeStyle = e.color; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.85;
+    for (const r of rows) {
+      if (!r[e.key]) continue;
+      const px = x(r.t);
+      ctx.beginPath(); ctx.moveTo(px, plotT); ctx.lineTo(px, plotB); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  });
+
   // eixo do tempo
   ctx.fillStyle = TXT; ctx.font = "11px Segoe UI"; ctx.textAlign = "center";
   niceTicks(d.tmin, d.tmax, 9).forEach(t => {
@@ -298,6 +350,17 @@ function drawCursor(x, yL, yR) {
   ];
   SERIES.filter(s => s.on).forEach(s =>
     lines.push(`${s.label}: ${fmt(r[s.key])}`));
+
+  const PHN = ["Piso 1", "aguardando", "descendo", "Piso 2", "subindo"];
+  if (isFinite(r.phase)) {
+    const ph = PHN[r.phase] || r.phase;
+    lines.push(`fase: ${ph}` + (isFinite(r.remain) && r.remain > 0 ? ` (${r.remain.toFixed(0)}s)` : ""));
+  }
+  if (isFinite(r.bite))   lines.push(`bateu no piso: ${r.bite}`);
+  if (isFinite(r.pierce)) lines.push(`furou piso 1: ${r.pierce}${r.blocked ? " (travado)" : ""}`);
+  if (r.furou) lines.push("→ FUROU aqui");
+  if (r.bol)   lines.push("→ BOLINHAS");
+  if (r.rst)   lines.push("→ RESET");
 
   ctx.font = "12px Segoe UI";
   const bw = 8 + Math.max(...lines.map(s => ctx.measureText(s).width)) + 6;

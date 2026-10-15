@@ -59,14 +59,24 @@
  *
  * Persistencia: config na EEPROM (sobrevive a desligar o Nano).
  *
- * CICLO DE PISO (Piso 2, oscilacao lenta no tempo):
+ * CICLO DE PISO (Piso 2, mergulho lento no tempo):
  *   Alem do Piso 1 (o2_floor), existe um Piso 2 (o2_floor2) MAIS BAIXO. Quando
- *   esta corrigindo e 0 < Piso2 < Piso1, o piso em vigor (activeFloor) oscila
- *   no tempo: segura no Piso 1 por Y ms (floor_period_ms), desce em rampa ate'
- *   o Piso 2, segura la por X ms (floor_hold_ms) e volta ao Piso 1. Fora do
- *   trigger (bypass) o ciclo pausa e volta ao Piso 1. A senoide pequena do piso
- *   (OSC_*) continua sendo aplicada POR CIMA de activeFloor. Piso2 = 0 desliga
- *   o ciclo (fica so no Piso 1, comportamento antigo).
+ *   esta corrigindo e 0 < Piso2 < Piso1, o piso em vigor (activeFloor) mergulha
+ *   do Piso 1 ao Piso 2 no tempo. REGRA: so mergulha para o Piso 2 quando NAO
+ *   esta "batendo no Piso 1" (ou seja, quando a correcao base ja segura o O2
+ *   acima do Piso 1 sozinha, sem o reforco precisar atuar).
+ *     HOLD1 -> segura no Piso 1 por Y ms (floor_period_ms). Vencido Y:
+ *                - se NAO esta batendo no Piso 1 -> mergulha ja (DOWN).
+ *                - se ESTA batendo no Piso 1    -> adia (WAIT): espera o valor
+ *                  SAIR de cima do Piso 1 (parar de bater) e, na PROXIMA vez que
+ *                  ele voltar a bater no Piso 1, aí sim mergulha (DOWN).
+ *     DOWN  -> tira a correcao em rampa ate' bater no Piso 2.
+ *     HOLD2 -> segura no Piso 2 por X ms (floor_hold_ms; conta ao atingi-lo).
+ *     UP    -> incrementa a correcao em rampa, subindo OBRIGATORIAMENTE ate' o
+ *              Piso 1 (ou acima) -> recomeca (HOLD1).
+ *   Fora do trigger (bypass) o ciclo pausa e volta ao Piso 1. A oscilacao
+ *   pequena do piso (OSC_*, agora meio aleatoria) continua POR CIMA de
+ *   activeFloor. Piso2 = 0 desliga o ciclo (fica so no Piso 1).
  *
  * Protocolo serial (115200):
  *   PC -> Nano:
@@ -80,10 +90,25 @@
  *     FL2:<v>        piso 2 de O2 (mais baixo; 0 = sem ciclo)
  *     HLD:<v>        tempo X: quanto segura no Piso 2 (ms)
  *     PER:<v>        tempo Y: quanto segura no Piso 1 entre mergulhos (ms)
+ *     MXF:<v>        max. de FURADAS do Piso 1 antes de travar (0 = sem limite)
+ *     RSF            zera o contador de furadas (libera furar de novo) = RESET
  *   Nano -> PC:
- *     CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms
+ *     CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms,max_pierces
  *     T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos>
+ *       <fase> <piso_vigor_x1000> <resta_ms> <bateu> <furou> <travado> <bolinhas> <reset>
  *        estado: 0=BYPASS 1=CORRIGINDO ; k_milesimos: 0..1000
+ *        fase: 0=Piso1 1=aguardando 2=descendo 3=Piso2 4=subindo
+ *        bateu/furou: contadores acumulados ; bolinhas/reset: pulso 0/1 no evento
+ *
+ * ENTRADAS EXTRAS (INPUT_PULLUP; "negativo" = aterrar o pino = LOW):
+ *   RESET_PIN    -> na borda de descida zera as furadas (= comando RSF).
+ *   BOLINHAS_PIN -> na borda de descida marca o evento "BOLINHAS" no log.
+ *   (pinos definidos por placa no bloco de Pinos abaixo.)
+ *
+ * TRAVA DE FURADAS (max_pierces):
+ *   Cada mergulho rumo ao Piso 2 conta uma "furada". Ao atingir max_pierces o
+ *   ciclo trava no Piso 1 (nao mergulha mais) ate' chegar um RESET (pino ou RSF),
+ *   que zera o contador e libera novas furadas. max_pierces = 0 -> sem limite.
  */
 
 #include <Arduino.h>
@@ -102,25 +127,80 @@
   const uint8_t CS_READ = 7;    // LEITURA (sensor/ECU)  -> GPIO7
   const uint8_t CS_SEND = 10;   // SAIDA (diagnostico)   -> GPIO10
   const uint8_t D3_PIN  = 3;    // override (INPUT_PULLUP) -> GPIO3
+  const uint8_t RESET_PIN    = 1; // negativo -> zera FURADAS do Piso 1 -> GPIO1
+  const uint8_t BOLINHAS_PIN = 0; // negativo -> evento "BOLINHAS" no log -> GPIO0
 #else
   // Arduino Nano (5V) - pinagem original
   const uint8_t CS_READ = 10;   // LEITURA (sensor/ECU)
   const uint8_t CS_SEND = 9;    // SAIDA (diagnostico)
   const uint8_t D3_PIN  = 3;    // entrada de override (INPUT_PULLUP)
+  const uint8_t RESET_PIN    = 4; // negativo -> zera FURADAS do Piso 1
+  const uint8_t BOLINHAS_PIN = 5; // negativo -> evento "BOLINHAS" no log
 #endif
 
 const uint32_t TARGET_ID  = 0x18F00F52;  // frame a corrigir (estendido)
 const uint16_t TELEM_MS   = 100;         // periodo da telemetria
-const uint32_t CFG_MAGIC  = 0x43414E37;  // "CAN7" - marca de EEPROM valida (cresceu: piso 2 + X/Y)
+const uint32_t CFG_MAGIC  = 0x43414E38;  // "CAN8" - marca de EEPROM valida (cresceu: max_pierces)
 
 // ---- Calibracao FIXA raw -> diag (raw0, dref, rref) ----
 const float NOX_RAW0 = 4000.0f,  NOX_DREF = 100.0f, NOX_RREF = 6000.0f;   // NOx
 const float O2_RAW0  = 23500.0f, O2_DREF  = 9.5f,   O2_RREF  = 42000.0f;  // O2
 
 // ---- Oscilacao do piso de O2 (evita linha reta no grafico) ----
-const uint32_t OSC_PERIOD_MS = 2500;    // periodo da oscilacao
-const float    OSC_AMP_FRAC  = 0.06f;   // amplitude = 6% acima do piso
-const float    TWO_PI_F      = 6.2831853f;
+// Antes era quase uma senoide. Agora e' DOMINADA por ruido suave (value noise)
+// com passo ALEATORIO + uma oitava rapida de textura por cima, deixando so um
+// residuo de senoide. Fica bem menos previsivel/periodica, mas continua suave
+// (smoothstep, sem saltos), com a MESMA amplitude (osc 0..1 aplicado como
+// OSC_AMP_FRAC acima do piso) e sempre >= piso.
+const uint32_t OSC_PERIOD_MS    = 2500;  // periodo da senoide residual
+const float    OSC_AMP_FRAC     = 0.06f; // amplitude = 6% acima do piso
+const uint32_t OSC_NOISE_MIN_MS = 900;   // passo do ruido lento: sorteado nessa faixa
+const uint32_t OSC_NOISE_MAX_MS = 1600;  //   (passo variavel quebra a periodicidade)
+const uint32_t OSC_FAST_MS      = 450;   // passo da oitava rapida (textura)
+const float    OSC_SINE_MIX     = 0.25f; // peso da senoide residual; resto e' ruido lento
+const float    OSC_FAST_AMP     = 0.22f; // amplitude da oitava rapida somada por cima
+const float    TWO_PI_F         = 6.2831853f;
+
+// Um canal de value-noise suave: interpola (smoothstep) entre alvos aleatorios
+// em [0,1]. "stepMs" e' re-sorteado a cada alvo entre [minMs,maxMs] (min==max ->
+// passo fixo) para nao ficar periodico. O estado do canal vem por referencia
+// (static no chamador), permitindo varios canais independentes.
+float valueNoise(unsigned long now, unsigned long &t0, uint32_t &stepMs,
+                 float &from, float &to, uint32_t minMs, uint32_t maxMs) {
+  if (now - t0 >= stepMs) {
+    t0     = now;
+    from   = to;
+    to     = (float)random(0, 1001) / 1000.0f;
+    stepMs = (minMs >= maxMs) ? minMs
+             : (uint32_t)random((long)minMs, (long)maxMs + 1);
+  }
+  float u = (float)(now - t0) / (float)stepMs;
+  if (u > 1.0f) u = 1.0f;
+  float s = u * u * (3.0f - 2.0f * u);                       // smoothstep
+  return from + (to - from) * s;                             // 0..1
+}
+
+// Gera a oscilacao do piso (0..1): ruido lento (passo aleatorio) dominante +
+// residuo de senoide + oitava rapida somada por cima. Clampa em [0,1].
+float floorOsc() {
+  unsigned long now = millis();
+
+  float ph   = (float)(now % OSC_PERIOD_MS) / (float)OSC_PERIOD_MS;
+  float sine = 0.5f + 0.5f * sin(TWO_PI_F * ph);             // 0..1
+
+  static unsigned long sT0 = 0, fT0 = 0;
+  static uint32_t sStep = OSC_NOISE_MIN_MS, fStep = OSC_FAST_MS;
+  static float sFrom = 0.5f, sTo = 0.5f, fFrom = 0.5f, fTo = 0.5f;
+
+  float slow = valueNoise(now, sT0, sStep, sFrom, sTo, OSC_NOISE_MIN_MS, OSC_NOISE_MAX_MS);
+  float fast = valueNoise(now, fT0, fStep, fFrom, fTo, OSC_FAST_MS, OSC_FAST_MS);
+
+  float osc = OSC_SINE_MIX * sine + (1.0f - OSC_SINE_MIX) * slow;  // base 0..1
+  osc += OSC_FAST_AMP * (fast - 0.5f);                            // textura +/-
+  if (osc < 0.0f) osc = 0.0f;
+  if (osc > 1.0f) osc = 1.0f;
+  return osc;
+}
 
 MCP_CAN CAN_READ(CS_READ);
 MCP_CAN CAN_SEND(CS_SEND);
@@ -136,6 +216,7 @@ struct Config {
   float    o2_floor2;      // Piso 2: piso mais baixo, atingido no ciclo (0 = desliga)
   uint32_t floor_hold_ms;  // tempo X: quanto segura no Piso 2 (conta ao atingi-lo)
   uint32_t floor_period_ms;// tempo Y: quanto segura no Piso 1 entre mergulhos
+  uint32_t max_pierces;    // limite de FURADAS do Piso 1 (0 = sem limite); zera com RESET
 };
 
 Config cfg;
@@ -150,11 +231,24 @@ unsigned long lastTelem = 0;
 unsigned long lastRamp = 0;
 
 // Ciclo do Piso 2 (Piso1 <-> Piso2 no tempo, so quando corrigindo)
-enum FloorPhase { FP_HOLD1, FP_DOWN, FP_HOLD2, FP_UP };
+//   FP_WAIT: venceu Y batendo no Piso 1 -> aguarda sair do Piso 1 e voltar a bater
+enum FloorPhase { FP_HOLD1, FP_WAIT, FP_DOWN, FP_HOLD2, FP_UP };
 uint8_t floorPhase = FP_HOLD1;
 float activeFloor = 0.0f;            // piso em vigor no instante (o que o reforco usa)
 unsigned long floorPhaseT0 = 0;      // inicio da fase atual (p/ contar X e Y)
 unsigned long lastFloorMs = 0;
+bool floorBiting = false;            // O2 corrigido batendo no Piso 1 (reforco atuando)
+bool floorReleased = false;          // no FP_WAIT: ja saiu de cima do Piso 1?
+
+// Contadores (vao para a telemetria/log)
+uint32_t biteCount = 0;              // quantas vezes BATEU no Piso 1 (borda de floorBiting)
+uint32_t pierceCount = 0;            // quantas vezes FUROU o Piso 1 (mergulhos iniciados)
+bool pierceBlocked = false;          // atingiu max_pierces -> segura no Piso 1 ate o RESET
+
+// Entradas extras (borda de descida = evento) + pulsos latched p/ a telemetria
+bool prevResetLow = false, prevBolinhasLow = false;
+bool resetEvent = false;             // pulso: RESET disparado desde o ultimo telem
+bool bolinhasEvent = false;          // pulso: BOLINHAS disparado desde o ultimo telem
 
 // Buffer serial
 char rxBuf[48];
@@ -171,10 +265,16 @@ uint16_t correct(uint16_t raw, float raw0, float signedPct);
 float rawToDiag(uint16_t raw, float raw0, float dref, float rref);
 void updateRamp();
 void updateFloorCycle();
+void updateInputs();
+void resetPierces();
 
 void setup() {
   Serial.begin(115200);
   pinMode(D3_PIN, INPUT_PULLUP);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  pinMode(BOLINHAS_PIN, INPUT_PULLUP);
+  prevResetLow    = (digitalRead(RESET_PIN) == LOW);     // nao dispara evento ao ligar
+  prevBolinhasLow = (digitalRead(BOLINHAS_PIN) == LOW);
 #if defined(ARDUINO_ARCH_ESP32)
   // No ESP32 a EEPROM e' emulada na flash: precisa reservar espaco antes de usar
   EEPROM.begin(sizeof(Config) + 16);
@@ -200,11 +300,13 @@ void setup() {
   lastRamp = millis();
   lastFloorMs = floorPhaseT0 = millis();
   activeFloor = cfg.o2_floor;
+  randomSeed(micros());   // semente p/ a oscilacao aleatoria do piso
   Serial.println(F("PRONTO: bridge CAN 250kbps ativo (CS10=leitura CS9=saida)"));
   sendConfig();
 }
 
 void loop() {
+  updateInputs();
   updateRamp();
   updateFloorCycle();
 
@@ -219,14 +321,49 @@ void loop() {
   if (hasData && now - lastTelem >= TELEM_MS) {
     lastTelem = now;
     int kmil = (int)(k * 1000.0f + 0.5f);
+    int afMil = (int)(activeFloor * 1000.0f + 0.5f);     // piso em vigor (x1000)
+    unsigned long el = now - floorPhaseT0, remain = 0;   // tempo restante na fase
+    if (floorPhase == FP_HOLD1 && !pierceBlocked) remain = (el < cfg.floor_period_ms) ? cfg.floor_period_ms - el : 0;
+    else if (floorPhase == FP_HOLD2) remain = (el < cfg.floor_hold_ms) ? cfg.floor_hold_ms - el : 0;
+    int bolP = bolinhasEvent ? 1 : 0, rstP = resetEvent ? 1 : 0;
+    bolinhasEvent = resetEvent = false;                  // consome os pulsos
     Serial.print(F("T "));
     Serial.print(s1Read); Serial.print(' ');
     Serial.print(s1Corr); Serial.print(' ');
     Serial.print(s2Read); Serial.print(' ');
     Serial.print(s2Corr); Serial.print(' ');
     Serial.print(correctActive ? 1 : 0); Serial.print(' ');
-    Serial.println(kmil);
+    Serial.print(kmil);          Serial.print(' ');
+    Serial.print(floorPhase);    Serial.print(' ');
+    Serial.print(afMil);         Serial.print(' ');
+    Serial.print(remain);        Serial.print(' ');
+    Serial.print(biteCount);     Serial.print(' ');
+    Serial.print(pierceCount);   Serial.print(' ');
+    Serial.print(pierceBlocked ? 1 : 0); Serial.print(' ');
+    Serial.print(bolP);          Serial.print(' ');
+    Serial.println(rstP);
   }
+}
+
+// Le as entradas extras (RESET e BOLINHAS), ambas INPUT_PULLUP -> ativas em
+// nivel BAIXO. Dispara na BORDA de descida (aterrou agora). RESET zera as
+// furadas (liberando novos mergulhos); BOLINHAS so marca um evento no log.
+void updateInputs() {
+  bool rLow = (digitalRead(RESET_PIN) == LOW);
+  if (rLow && !prevResetLow) resetPierces();
+  prevResetLow = rLow;
+
+  bool bLow = (digitalRead(BOLINHAS_PIN) == LOW);
+  if (bLow && !prevBolinhasLow) bolinhasEvent = true;
+  prevBolinhasLow = bLow;
+}
+
+// Zera o contador de furadas e destrava o ciclo (pode furar de novo). Marca o
+// evento RESET no log. Chamado pelo pino RESET (negativo) ou pelo comando RSF.
+void resetPierces() {
+  pierceCount = 0;
+  pierceBlocked = false;
+  resetEvent = true;
 }
 
 // Atualiza o alvo (trigger de O2 + override do D3) e faz a rampa de 'k'.
@@ -255,14 +392,18 @@ void updateRamp() {
 }
 
 // Ciclo do Piso 2: enquanto esta corrigindo (dentro do trigger) e o Piso 2 for
-// valido (0 < piso2 < piso1), o piso em vigor (activeFloor) oscila NO TEMPO:
-//   HOLD1 -> segura no Piso 1 por Y (floor_period_ms)
-//   DOWN  -> desce em rampa ate o Piso 2
+// valido (0 < piso2 < piso1), o piso em vigor (activeFloor) mergulha NO TEMPO,
+// mas so entra no Piso 2 quando NAO esta batendo no Piso 1 (floorBiting):
+//   HOLD1 -> segura no Piso 1 por Y (floor_period_ms). Vencido Y:
+//              nao batendo -> DOWN ja ; batendo -> FP_WAIT (adia o mergulho).
+//   WAIT  -> segura no Piso 1 ate' SAIR de cima dele (parar de bater) e, na
+//            PROXIMA vez que voltar a bater, mergulha (DOWN).
+//   DOWN  -> tira a correcao em rampa ate o Piso 2.
 //   HOLD2 -> segura no Piso 2 por X (floor_hold_ms; conta a partir de atingi-lo)
-//   UP    -> sobe em rampa de volta ao Piso 1 -> recomeca (HOLD1)
+//   UP    -> incrementa a correcao em rampa, subindo ate o Piso 1 -> HOLD1.
 // Fora do trigger (bypass) o ciclo pausa/zera: volta pro Piso 1. A rampa entre
-// pisos reusa o mesmo tempo de rampa (ramp_ms). A oscilacao senoidal pequena do
-// piso continua sendo aplicada POR CIMA de activeFloor (em pumpBus).
+// pisos reusa o mesmo tempo de rampa (ramp_ms). A oscilacao pequena do piso
+// continua sendo aplicada POR CIMA de activeFloor (em pumpBus).
 void updateFloorCycle() {
   unsigned long now = millis();
   unsigned long dt = now - lastFloorMs;
@@ -272,9 +413,15 @@ void updateFloorCycle() {
   float piso2 = cfg.o2_floor2;
   bool cycleOn = correctActive && piso1 > 0.0f && piso2 > 0.0f && piso2 < piso1;
 
+  // Atingiu o limite de furadas? (0 = sem limite). Enquanto travado, segura no
+  // Piso 1 e nao mergulha ate' vir o RESET (pino negativo ou comando RSF).
+  bool canPierce = (cfg.max_pierces == 0) || (pierceCount < cfg.max_pierces);
+  pierceBlocked = !canPierce;
+
   if (!cycleOn) {                 // sem ciclo: fica no Piso 1 (comportamento antigo)
     floorPhase = FP_HOLD1;
     floorPhaseT0 = now;
+    floorReleased = false;
     activeFloor = piso1;
     return;
   }
@@ -286,7 +433,24 @@ void updateFloorCycle() {
   switch (floorPhase) {
     case FP_HOLD1:
       activeFloor = piso1;
-      if (now - floorPhaseT0 >= cfg.floor_period_ms) floorPhase = FP_DOWN;  // passou Y
+      if (now - floorPhaseT0 >= cfg.floor_period_ms) {       // venceu Y
+        if (!canPierce) {
+          floorPhaseT0 = now;                                // travado: segura no Piso 1
+        } else if (!floorBiting) {
+          floorPhase = FP_DOWN; pierceCount++;               // livre -> FUROU (mergulha)
+        } else {
+          floorPhase = FP_WAIT;                              // batendo -> adia
+          floorReleased = false;
+        }
+      }
+      break;
+    case FP_WAIT:
+      activeFloor = piso1;                                   // segue no Piso 1
+      if (!floorReleased) {
+        if (!floorBiting) floorReleased = true;              // saiu de cima do Piso 1
+      } else if (floorBiting) {
+        floorPhase = FP_DOWN; pierceCount++;                 // voltou a bater -> FUROU
+      }
       break;
     case FP_DOWN:
       activeFloor -= step;
@@ -302,7 +466,7 @@ void updateFloorCycle() {
       break;
     case FP_UP:
       activeFloor += step;
-      if (activeFloor >= piso1) {              // voltou ao Piso 1
+      if (activeFloor >= piso1) {              // voltou ao Piso 1 (ou acima)
         activeFloor = piso1;
         floorPhase = FP_HOLD1;
         floorPhaseT0 = now;                    // recomeca Y
@@ -339,15 +503,21 @@ void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection) {
         g = cfg.pct * p;
       }
 
+      // "Batendo no Piso 1": O2 corrigido so pela correcao BASE (sem o reforco,
+      // ja com a rampa) ficaria abaixo do Piso 1 -> o reforco precisa atuar.
+      // (rawToDiag e' linear -> O2 corrigido diag = o2d * (1 + ganho/100).)
+      float o2baseCorr = o2d * (1.0f + (g * k) / 100.0f);
+      bool nowBiting = (cfg.o2_floor > 0.0f) && (o2baseCorr < cfg.o2_floor);
+      if (nowBiting && !floorBiting) biteCount++;   // conta a BORDA (comecou a bater)
+      floorBiting = nowBiting;
+
       // Reforco do piso (com oscilacao): vale nos DOIS modos. Sobe o ganho
       // para o O2 corrigido NAO baixar do piso EM VIGOR (activeFloor, que o
       // ciclo do Piso 2 move no tempo), com o alvo oscilando um pouco acima
       // dele - inclusive quando a escala proporcional deixaria o ganho baixo
       // demais perto do trigger.
       if (activeFloor > 0.0f && o2d > 0.01f) {
-        float ph  = (float)(millis() % OSC_PERIOD_MS) / (float)OSC_PERIOD_MS;
-        float osc = 0.5f + 0.5f * sin(TWO_PI_F * ph);            // 0..1
-        float tgt = activeFloor * (1.0f + OSC_AMP_FRAC * osc);   // piso..piso+6%
+        float tgt = activeFloor * (1.0f + OSC_AMP_FRAC * floorOsc()); // piso..piso+6%
         float gNeeded = 100.0f * (tgt / o2d - 1.0f);
         if (gNeeded > g) g = gNeeded;         // reforca para nao baixar do piso
       }
@@ -393,6 +563,7 @@ void loadConfig() {
     cfg.o2_floor2       = 0;    // Piso 2 desligado por padrao (ciclo inativo)
     cfg.floor_hold_ms   = 5000; // X: 5 s no Piso 2
     cfg.floor_period_ms = 60000;// Y: 60 s no Piso 1 entre mergulhos
+    cfg.max_pierces     = 1;    // por padrao fura 1x e trava ate o RESET
     saveConfig();
   }
 }
@@ -414,7 +585,8 @@ void sendConfig() {
   Serial.print(cfg.prop_band);       Serial.print(',');
   Serial.print(cfg.o2_floor2, 3);    Serial.print(',');
   Serial.print(cfg.floor_hold_ms);   Serial.print(',');
-  Serial.println(cfg.floor_period_ms);
+  Serial.print(cfg.floor_period_ms); Serial.print(',');
+  Serial.println(cfg.max_pierces);
 }
 
 // ---- Comandos serial ----
@@ -447,4 +619,6 @@ void handleLine(char *line) {
   if (strncmp(line, "FL2:", 4) == 0) { cfg.o2_floor2       = atof(line + 4); saveConfig(); sendConfig(); return; }
   if (strncmp(line, "HLD:", 4) == 0) { cfg.floor_hold_ms   = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
   if (strncmp(line, "PER:", 4) == 0) { cfg.floor_period_ms = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
+  if (strncmp(line, "MXF:", 4) == 0) { cfg.max_pierces     = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
+  if (strcmp(line, "RSF") == 0)      { resetPierces(); return; }   // zera furadas (botao da UI)
 }

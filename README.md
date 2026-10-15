@@ -21,18 +21,35 @@ o ganho, o trigger, a rampa e o modo do D3 — tudo **gravado na EEPROM**
 - **Piso de O2 (2º limite):** se a correção base não segurar o O2 corrigido
   acima do piso, o ganho **aumenta dinamicamente** (O2 e NOx juntos) para o O2
   **não baixar desse valor**. Em vez de virar uma linha reta, o alvo **oscila**
-  um pouco acima do piso (padrão: período 2,5 s, amplitude 6 %). `Piso = 0`
-  desliga esse reforço.
+  um pouco acima do piso (amplitude ≈ 6 %). A oscilação é **dominada por ruído
+  suave com passo aleatório** (não mais uma senoide previsível), mantendo a
+  amplitude e **nunca baixando do piso**. `Piso = 0` desliga esse reforço.
 - **Piso 2 (ciclo temporizado):** um **segundo piso, mais baixo**, que o alvo
   passa a "bater" periodicamente **enquanto está corrigindo** (dentro do
   trigger). O ciclo é: segura no **Piso 1** por **Y** (`Tempo Y`) → **desce em
   rampa** até o **Piso 2** → conta **X** (`Tempo X`) **a partir do instante em
-  que atinge o Piso 2** → **sobe em rampa** de volta ao Piso 1 → recomeça, em
-  loop. A rampa entre os pisos reusa o mesmo `Rampa (ms)`. A **oscilação
-  senoidal pequena continua aplicada por cima** do piso que estiver ativo no
-  momento (Piso 1 ou Piso 2). Fora do trigger (bypass) o ciclo **pausa e volta
-  ao Piso 1**. `Piso 2 = 0` (ou `Piso 2 ≥ Piso 1`) **desliga o ciclo** — fica só
-  o Piso 1 de sempre. Exige `0 < Piso 2 < Piso 1`.
+  que atinge o Piso 2** → **sobe em rampa** obrigatoriamente de volta ao Piso 1
+  → recomeça, em loop. **Regra:** o mergulho ao Piso 2 só acontece quando **não
+  está "batendo" no Piso 1** (quando a correção base já segura o O2 acima do
+  Piso 1 sozinha). Se, ao vencer o Y, o valor estiver batendo no Piso 1, o
+  mergulho é **adiado**: espera o valor **sair de cima do Piso 1** e, na
+  **próxima** vez que voltar a bater, aí sim mergulha. A rampa entre os pisos
+  reusa o mesmo `Rampa (ms)`. A **oscilação pequena (aleatória) continua
+  aplicada por cima** do piso ativo no momento (Piso 1 ou Piso 2). Fora do
+  trigger (bypass) o ciclo **pausa e volta ao Piso 1**. `Piso 2 = 0` (ou
+  `Piso 2 ≥ Piso 1`) **desliga o ciclo**. Exige `0 < Piso 2 < Piso 1`.
+- **Furadas do Piso 1 + trava e reset:** cada mergulho rumo ao Piso 2 conta uma
+  **"furada"** do Piso 1. O campo **`Máx. furadas Piso 1`** limita quantas são
+  permitidas (padrão **1**; `0` = sem limite). Ao atingir o limite, o ciclo
+  **trava no Piso 1** (não mergulha mais) até chegar um **reset**. O reset vem
+  de uma **entrada de hardware (nível baixo/negativo)** ou do botão **"Zerar
+  furadas"** no app/página — ele zera o contador e **libera furar de novo**.
+- **Entrada BOLINHAS:** uma segunda entrada de hardware (`INPUT_PULLUP`); quando
+  recebe **negativo** (vai ao GND), registra um evento **`BOLINHAS`** no log.
+- **Contadores no log:** o firmware conta e envia na telemetria **quantas vezes
+  bateu no Piso 1** (reforço segurou o O2) e **quantas vezes furou o Piso 1**
+  (mergulhos), além da **fase do ciclo** e dos **tempos restantes** — tudo vai
+  para o log/CSV.
 - **Correção proporcional à faixa (modo alternativo):** quando ligada, o ganho
   vira **proporcional à posição do O2 lido dentro da faixa `[piso, trigger]`**:
   perto do **trigger** a correção é **mínima (0 %)**, perto do **piso** é
@@ -80,6 +97,12 @@ Só o pino **CS** é separado (D10 e D9). Os pinos INT não são usados (polling
 normal (trigger de O2) ou **ligado ao GND** (negativo) para forçar o modo
 configurado no app (Bypass ou Corrigindo).
 
+**Entradas extras** (também `INPUT_PULLUP`, ativas em nível **baixo/negativo**):
+
+- **RESET de furadas = D4** — um pulso ao GND **zera o contador de furadas** do
+  Piso 1 (libera o ciclo a furar de novo); equivale ao botão "Zerar furadas".
+- **BOLINHAS = D5** — um pulso ao GND registra o evento **`BOLINHAS`** no log.
+
 > O barramento precisa ser **fisicamente aberto**: o trecho do sensor vai no
 > módulo de leitura (CS10) e o trecho do diagnóstico no módulo de saída (CS9).
 > Todo ID diferente de `18F00F52` é repassado intacto nos dois sentidos.
@@ -94,6 +117,7 @@ configurado no app (Bypass ou Corrigindo).
 | Piso 2 O2           | 0       | piso mais baixo do ciclo (0 ou ≥Piso 1 = desliga)|
 | Tempo X             | 5000 ms | quanto segura no Piso 2 (conta ao atingi-lo)    |
 | Tempo Y             | 60000 ms| intervalo no Piso 1 entre mergulhos ao Piso 2   |
+| Máx. furadas Piso 1 | 1       | quantas furadas antes de travar (0 = sem limite); reset libera |
 | Rampa               | 2000 ms | tempo de 0 → 100 % ao entrar/sair; e rampa entre pisos |
 | D3 negativo         | Bypass  | modo do D3 baixo: Bypass (força) ou Corrigindo (segue trigger) |
 | Correção            | Fixa    | Fixa (piso oscila) ou Proporcional à faixa      |
@@ -112,8 +136,9 @@ Porta o **mesmo corretor** para a placa **LilyGO T-2CAN**, trocando a
 comunicação por **Wi-Fi + página web**: não precisa mais do cabo USB nem do
 app do PC para operar. A placa **cria a própria rede Wi-Fi** e serve uma página
 que mostra a telemetria ao vivo e ajusta todos os parâmetros (ganho, trigger,
-piso 1, **piso 2 + tempos X/Y do ciclo**, rampa, correção e D3), gravados na
-EEPROM.
+piso 1, **piso 2 + tempos X/Y do ciclo**, **máx. furadas**, rampa, correção e
+D3), com botão **Zerar furadas** e **contadores ao vivo** (bateu/furou), tudo
+gravado na EEPROM.
 
 > A base da correção é a **mesma** do firmware do Arduino — mudaram a fiação CAN
 > e o meio de comunicação. Firmware novo: `firmware/src/t2can_main.cpp`.
@@ -138,7 +163,9 @@ entra no conector CAN do **MCP2515** e o outro no conector do **CAN nativo**.
 
 Pinos usados pelo firmware (T-2CAN V1.0, **cristal do MCP2515 = 16 MHz**):
 `SPI SCLK=12 MOSI=11 MISO=13` · `MCP2515 CS=10 RST=9` · `TWAI TX=7 RX=6` ·
-`override físico = IO4` (deixe solto para operação normal).
+`override físico = IO4` · `RESET de furadas = IO15` · `BOLINHAS = IO16`
+(as três entradas são `INPUT_PULLUP`, ativas em nível baixo; deixe o override
+solto para operação normal).
 
 ### Fiação do barramento (bornes da própria placa)
 
@@ -170,16 +197,26 @@ O override por hardware (força Bypass/Corrigindo) está no pad **`IO4`** da pla
 - Use um **interruptor de trava / chave gangorra** (fica ligado). Um botão de
   pressão momentâneo só forçaria o modo enquanto ficasse apertado.
 
+**Entradas extras na T-2CAN** (`INPUT_PULLUP`, ativas em nível baixo):
+
+- **`IO15` = RESET de furadas** — um **pulso ao GND** zera o contador de furadas
+  do Piso 1 (destrava o ciclo). Aqui um **botão momentâneo** serve bem (basta um
+  toque); também dá para usar o botão **"Zerar furadas"** da página.
+- **`IO16` = BOLINHAS** — um **pulso ao GND** registra o evento `BOLINHAS` no
+  log (igual ao Nano).
+
 ### Como usar (depois de gravar)
 
 1. Ligue a T-2CAN (USB-C ou 12–24 V no conector DC).
 2. No celular/notebook, conecte no Wi-Fi **`Starlink Labs`** — senha **`11021992`**.
 3. Abra **`http://192.168.4.1`** no navegador.
 4. A página mostra **BYPASS / CORRIGINDO**, os valores **Lido × Corrigido** de
-   O2 e NOx (com gráfico ao vivo) e todos os campos de configuração. Ajuste e
-   clique **Aplicar** — grava na EEPROM na hora.
-5. **Gravar log** salva um `.csv` (mesmas colunas de antes) direto no aparelho,
-   que você abre no `log_viewer.html`.
+   O2 e NOx (com gráfico ao vivo — com **marcas de furou / BOLINHAS / RESET**),
+   os **contadores do ciclo** (bateu/furou) e todos os campos de configuração.
+   Ajuste e clique **Aplicar tudo** — grava todos os campos na EEPROM na hora;
+   **Zerar furadas** destrava o ciclo (libera furar de novo).
+5. **Gravar log** salva um `.csv` (colunas completas: contadores, timers e
+   eventos) direto no aparelho, que você abre no `log_viewer.html`.
 
 > O SSID/senha ficam no topo do `t2can_main.cpp` (`AP_SSID` / `AP_PASS`) — a
 > senha precisa ter no mínimo 8 caracteres.
@@ -283,13 +320,16 @@ python app.py
 2. Selecione a porta COM do Nano e clique **Conectar** (o app pede a config).
 3. O painel mostra ao vivo o valor final **Lido** e **Corrigido** do O2 e do NOx,
    e um status grande **BYPASS / CORRIGINDO** (com o % da rampa em transição).
-4. Ajuste **Ganho / Trigger O2 / Piso 1 / Piso 2 / Tempo X / Tempo Y / Rampa
-   (ms)** e clique **Aplicar** (cada botão grava aquele campo na EEPROM). Se o
-   Piso 1 ficar acima do trigger, ou o Piso 2 ficar ≥ Piso 1, o app avisa com um
-   alerta. **Piso 2 = 0** desliga o ciclo temporizado (fica só o Piso 1).
-5. Em **Correção**, escolha **Fixa (piso oscila)** ou **Proporcional à faixa**
-   e clique **Aplicar**.
-6. Escolha o modo do **D3 negativo** (Bypass ou Corrigindo) e clique **Aplicar**.
+4. Ajuste **Ganho / Trigger O2 / Piso 1 / Piso 2 / Tempo X / Tempo Y / Máx.
+   furadas Piso 1 / Rampa (ms)**, o modo de **Correção** (Fixa ou Proporcional à
+   faixa) e o modo do **D3 negativo** (Bypass ou Corrigindo). Um **único botão
+   "Aplicar tudo"** grava **todos** os campos na EEPROM de uma vez. Se o Piso 1
+   ficar acima do trigger, ou o Piso 2 ficar ≥ Piso 1, o app avisa com um alerta.
+   **Piso 2 = 0** desliga o ciclo temporizado (fica só o Piso 1).
+5. O painel **Ciclo do piso** mostra ao vivo **quantas vezes bateu** e **quantas
+   furou** o Piso 1, a **fase / piso em vigor** e o **último evento**
+   (BOLINHAS / RESET). O botão **"Zerar furadas"** manda o reset (destrava e
+   libera furar de novo) — equivale a aterrar a entrada de RESET no hardware.
 
 ## 3. Log e visualização gráfica
 
@@ -307,20 +347,30 @@ O visualizador mostra **tudo num único gráfico de eixo duplo** (O2 na escala d
 esquerda, NOx ppm na direita), na mesma linha do tempo:
 
 - **O2:** lido × corrigido, com as linhas de referência do **trigger**
-  (tracejada laranja), do **piso 1** (pontilhada vermelha) e do **piso 2**
-  (pontilhada magenta) — são só referência do que você configurou;
+  (tracejada laranja), do **piso 1** (pontilhada vermelha), do **piso 2**
+  (pontilhada magenta) e do **piso em vigor** (roxo — o piso que o ciclo usa a
+  cada instante);
 - **NOx (ppm):** lido × corrigido;
 - **faixas verdes** marcam os trechos em que o trigger estava ativo
-  (**CORRIGINDO**); passe o mouse para ler os valores em cada instante.
+  (**CORRIGINDO**);
+- **linhas verticais** marcam os eventos na linha do tempo: **furou o piso 1**
+  (vermelho), **BOLINHAS** (azul) e **RESET** (laranja) — assim dá para ver
+  **quando** cada furada aconteceu (o resumo no topo conta o total de furadas).
+  Passe o mouse para ler os valores, a fase e os contadores em cada instante.
 
-Cada linha tem uma **caixa de seleção** no topo para mostrar/ocultar
-individualmente (O2 lido, O2 corrigido, trigger, piso, NOx lido, NOx corrigido).
+Cada linha/evento tem uma **caixa de seleção** no topo para mostrar/ocultar
+individualmente.
 
 Colunas do CSV: `t_s, o2_read, o2_corr, nox_read, nox_corr, o2_trigger,
-o2_floor, o2_floor2, state, ramp_pct` (`state`: 0=bypass, 1=corrigindo; `t_s`
-em segundos desde o início da gravação). A coluna `o2_floor2` (Piso 2) agora é
-gravada tanto pelo `app.py` quanto pela T-2CAN; o visualizador ignora colunas
-ausentes, então logs antigos (sem `o2_floor2`) continuam abrindo normalmente.
+o2_floor, o2_floor2, state, ramp_pct, phase, active_floor, phase_remain_s,
+hold_ms, period_ms, bite_count, pierce_count, blocked, bolinhas, reset`
+(`state`: 0=bypass, 1=corrigindo; `phase`: 0=Piso 1, 1=aguardando, 2=descendo,
+3=Piso 2, 4=subindo; `active_floor` = piso em vigor; `phase_remain_s` = tempo
+restante da fase; `bite_count`/`pierce_count` = contadores acumulados de
+"bateu"/"furou" o Piso 1; `blocked` = ciclo travado por limite de furadas;
+`bolinhas`/`reset` = pulso 0/1 no evento; `t_s` em segundos desde o início). O
+visualizador **ignora colunas ausentes**, então logs antigos continuam abrindo
+normalmente.
 
 ## Protocolo serial
 
@@ -336,9 +386,14 @@ ausentes, então logs antigos (sem `o2_floor2`) continuam abrindo normalmente.
   - `FL2:<v>` — Piso 2 de O2 (piso mais baixo do ciclo; `0` desliga).
   - `HLD:<ms>` — Tempo X: quanto segura no Piso 2.
   - `PER:<ms>` — Tempo Y: intervalo no Piso 1 entre mergulhos.
+  - `MXF:<v>` — máx. de furadas do Piso 1 antes de travar (`0` = sem limite).
+  - `RSF` — zera o contador de furadas (destrava; = pulso no pino de RESET).
 - Nano → PC:
-  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms`
-    — config atual (9 campos no firmware atual do Nano e da T-2CAN; firmwares
-    antigos do Nano mandavam só os 6 primeiros).
-  - `T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos>` —
-    telemetria (~10 Hz); `estado`: 0=BYPASS 1=CORRIGINDO, `k`: 0..1000.
+  - `CFG pct,o2_trigger,o2_floor,ramp_ms,d3mode,prop_band,o2_floor2,hold_ms,period_ms,max_pierces`
+    — config atual (10 campos no firmware atual do Nano e da T-2CAN; firmwares
+    antigos mandavam menos — os clientes ignoram os campos que faltam).
+  - `T <s1_lido> <s1_corr> <s2_lido> <s2_corr> <estado> <k_milesimos> <fase> <piso_vigor×1000> <resta_ms> <bateu> <furou> <travado> <bolinhas> <reset>`
+    — telemetria (~10 Hz). `estado`: 0=BYPASS 1=CORRIGINDO; `k`: 0..1000; `fase`:
+    0=Piso 1, 1=aguardando, 2=descendo, 3=Piso 2, 4=subindo; `bateu`/`furou`:
+    contadores acumulados; `travado`: 0/1 (limite de furadas atingido);
+    `bolinhas`/`reset`: pulso 0/1 no evento.

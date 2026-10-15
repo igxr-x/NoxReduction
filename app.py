@@ -31,6 +31,9 @@ BAUD = 115200
 CAL_NOX = (4000.0, 100.0, 6000.0)     # Sensor 1
 CAL_O2 = (23500.0, 9.5, 42000.0)      # Sensor 2
 
+# Nomes das fases do ciclo do piso (indice = campo <fase> da telemetria)
+PHN = ["Piso 1", "aguardando", "descendo", "Piso 2", "subindo"]
+
 
 def to_float(s, default=0.0):
     try:
@@ -66,7 +69,7 @@ class App:
         self.log_path = ""
 
         root.title("Bridge CAN 18F00F52 - corretor de sensores")
-        root.geometry("560x630")
+        root.geometry("560x790")
         root.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -107,37 +110,42 @@ class App:
         self.nox_corr = self._reading(live, "                Corrigido:", "#060")
         ttk.Frame(live, height=4).pack()
 
+        # ---- contadores do ciclo do piso ----
+        cyc = ttk.LabelFrame(root, text="Ciclo do piso")
+        cyc.pack(fill="x", padx=10, pady=4)
+        self.lbl_bite = self._reading(cyc, "Bateu no Piso 1 (vezes):")
+        self.lbl_pierce = self._reading(cyc, "Furou o Piso 1 (vezes):", "#060")
+        self.lbl_phase = self._reading(cyc, "Piso em vigor / fase:")
+        self.lbl_evt = self._reading(cyc, "Ultimo evento:")
+        ttk.Frame(cyc, height=4).pack()
+
         # ---- configuracoes ----
         cfg = ttk.LabelFrame(root, text="Configuracoes (gravam na EEPROM)")
         cfg.pack(fill="x", padx=10, pady=6)
 
         self.e_pct = self._cfg_row(
-            cfg, "Ganho proporcional:", "0", "%   (O2 +X% / NOx -X%)",
-            lambda: self.send(f"PCT:{to_float(self.e_pct.get()):g}"))
+            cfg, "Ganho proporcional:", "0", "%   (O2 +X% / NOx -X%)")
 
         self.e_trg = self._cfg_row(
-            cfg, "Trigger O2 (corrige se O2 <):", "5", "",
-            self.apply_trg)
+            cfg, "Trigger O2 (corrige se O2 <):", "5", "")
 
         self.e_flr = self._cfg_row(
-            cfg, "Piso 1 O2 (nao baixar de):", "3", "  (0 = desliga; oscila)",
-            self.apply_flr)
+            cfg, "Piso 1 O2 (nao baixar de):", "3", "  (0 = desliga; oscila)")
 
         self.e_flr2 = self._cfg_row(
-            cfg, "Piso 2 O2 (mais baixo):", "0", "  (0 = sem ciclo)",
-            self.apply_flr2)
+            cfg, "Piso 2 O2 (mais baixo):", "0", "  (0 = sem ciclo)")
 
         self.e_hld = self._cfg_row(
-            cfg, "Tempo X (segura no Piso 2):", "5000", "ms",
-            lambda: self.send(f"HLD:{int(to_float(self.e_hld.get()))}"))
+            cfg, "Tempo X (segura no Piso 2):", "5000", "ms")
 
         self.e_per = self._cfg_row(
-            cfg, "Tempo Y (segura no Piso 1):", "60000", "ms   (entre mergulhos)",
-            lambda: self.send(f"PER:{int(to_float(self.e_per.get()))}"))
+            cfg, "Tempo Y (segura no Piso 1):", "60000", "ms   (entre mergulhos)")
+
+        self.e_mxf = self._cfg_row(
+            cfg, "Max. furadas Piso 1:", "1", "  (0 = sem limite)")
 
         self.e_rmp = self._cfg_row(
-            cfg, "Rampa:", "2000", "ms   (suaviza entra/sai do trigger)",
-            lambda: self.send(f"RMP:{int(to_float(self.e_rmp.get()))}"))
+            cfg, "Rampa:", "2000", "ms   (suaviza entra/sai do trigger)")
 
         # Modo de correcao (proporcional a faixa trigger<->piso)
         pm = ttk.Frame(cfg)
@@ -148,7 +156,6 @@ class App:
                                               "Proporcional a faixa"])
         self.prop_mode.current(0)
         self.prop_mode.pack(side="left")
-        ttk.Button(pm, text="Aplicar", command=self.apply_prop).pack(side="left", padx=6)
 
         # D3
         d3 = ttk.Frame(cfg)
@@ -158,8 +165,17 @@ class App:
                                     values=["Bypass", "Corrigindo"])
         self.d3_mode.current(0)
         self.d3_mode.pack(side="left")
-        ttk.Button(d3, text="Aplicar", command=self.apply_d3).pack(side="left", padx=6)
         ttk.Label(d3, text="(pino D3 em nivel baixo)").pack(side="left")
+
+        # ---- botao unico: aplica TODAS as configuracoes de uma vez ----
+        applybar = ttk.Frame(cfg)
+        applybar.pack(fill="x", padx=10, pady=(8, 6))
+        ttk.Button(applybar, text="Aplicar tudo",
+                   command=self.apply_all).pack(side="left")
+        ttk.Button(applybar, text="Zerar furadas",
+                   command=self.reset_furos).pack(side="left", padx=6)
+        ttk.Label(applybar,
+                  text="(grava na EEPROM; zerar libera novas furadas)").pack(side="left", padx=8)
 
         self.refresh_ports()
         self.poll_serial()
@@ -173,40 +189,43 @@ class App:
         val.pack(side="left")
         return val
 
-    def _cfg_row(self, parent, label, default, suffix, cmd):
+    def _cfg_row(self, parent, label, default, suffix):
         row = ttk.Frame(parent)
         row.pack(fill="x", padx=10, pady=3)
         ttk.Label(row, text=label, width=26).pack(side="left")
         e = ttk.Entry(row, width=8)
         e.insert(0, default)
         e.pack(side="left")
-        ttk.Button(row, text="Aplicar", command=cmd).pack(side="left", padx=6)
         if suffix:
-            ttk.Label(row, text=suffix).pack(side="left")
+            ttk.Label(row, text=suffix).pack(side="left", padx=(6, 0))
         return e
 
-    def apply_d3(self):
-        # Bypass = 1, Corrigindo = 0
-        self.send(f"D3:{1 if self.d3_mode.get() == 'Bypass' else 0}")
-
-    def apply_trg(self):
+    def apply_all(self):
+        # Botao unico: envia TODOS os campos para o firmware (cada um grava na
+        # EEPROM). Proporcional a faixa = 1 / Fixa = 0 ; D3 Bypass = 1 / Corrigindo = 0.
+        if not (self.ser and self.ser.is_open):
+            messagebox.showwarning("Sem conexao",
+                                   "Conecte a uma porta serial antes de aplicar.")
+            return
+        self.send(f"PCT:{to_float(self.e_pct.get()):g}")
         self.send(f"TRG:{to_float(self.e_trg.get()):g}")
-        self.check_band()
-
-    def apply_flr(self):
         self.send(f"FLR:{to_float(self.e_flr.get()):g}")
-        self.check_band()
-
-    def apply_flr2(self):
         self.send(f"FL2:{to_float(self.e_flr2.get()):g}")
+        self.send(f"HLD:{int(to_float(self.e_hld.get()))}")
+        self.send(f"PER:{int(to_float(self.e_per.get()))}")
+        self.send(f"MXF:{int(to_float(self.e_mxf.get()))}")
+        self.send(f"RMP:{int(to_float(self.e_rmp.get()))}")
+        self.send(f"PRP:{1 if self.prop_mode.get().startswith('Prop') else 0}")
+        self.send(f"D3:{1 if self.d3_mode.get() == 'Bypass' else 0}")
         self.check_band()
 
-    def apply_prop(self):
-        # Proporcional a faixa = 1, Fixa = 0
-        on = self.prop_mode.get().startswith("Prop")
-        self.send(f"PRP:{1 if on else 0}")
-        if on:
-            self.check_band()
+    def reset_furos(self):
+        # Envia o comando de reset (zera o contador de furadas no firmware).
+        if not (self.ser and self.ser.is_open):
+            messagebox.showwarning("Sem conexao",
+                                   "Conecte a uma porta serial antes de zerar.")
+            return
+        self.send("RSF")
 
     def check_band(self):
         # Alertas simples de faixa: Piso 1 nao pode ficar acima do trigger, e o
@@ -244,7 +263,9 @@ class App:
             self.logf = None
             return
         self.logf.write("t_s,o2_read,o2_corr,nox_read,nox_corr,"
-                        "o2_trigger,o2_floor,o2_floor2,state,ramp_pct\n")
+                        "o2_trigger,o2_floor,o2_floor2,state,ramp_pct,"
+                        "phase,active_floor,phase_remain_s,hold_ms,period_ms,"
+                        "bite_count,pierce_count,blocked,bolinhas,reset\n")
         self.log_t0 = time.perf_counter()
         self.log_n = 0
         self.log_path = path
@@ -266,16 +287,21 @@ class App:
         else:
             self.log_lbl.config(text="log parado", foreground="#777")
 
-    def log_sample(self, o2r, o2c, nr, nc, st, kmil):
+    def log_sample(self, o2r, o2c, nr, nc, st, kmil,
+                   phase, af, remain, bite, pierce, blocked, bol, rst):
         if not self.logf:
             return
         t = time.perf_counter() - self.log_t0
         trg = to_float(self.e_trg.get())
         flr = to_float(self.e_flr.get())
         flr2 = to_float(self.e_flr2.get())
+        hld = int(to_float(self.e_hld.get()))
+        per = int(to_float(self.e_per.get()))
         try:
             self.logf.write(f"{t:.3f},{o2r:.3f},{o2c:.3f},{nr:.3f},{nc:.3f},"
-                            f"{trg:g},{flr:g},{flr2:g},{st},{kmil / 10:.1f}\n")
+                            f"{trg:g},{flr:g},{flr2:g},{st},{kmil / 10:.1f},"
+                            f"{phase},{af:.3f},{remain / 1000:.2f},{hld},{per},"
+                            f"{bite},{pierce},{blocked},{bol},{rst}\n")
         except OSError:
             self.stop_log()
             return
@@ -365,11 +391,13 @@ class App:
             return
         if line.startswith("T "):
             parts = line.split()
-            if len(parts) == 7:
+            if len(parts) >= 15:
                 try:
-                    s1r, s1c, s2r, s2c, st, kmil = (int(x) for x in parts[1:])
+                    (s1r, s1c, s2r, s2c, st, kmil, phase, afmil, remain,
+                     bite, pierce, blocked, bol, rst) = (int(x) for x in parts[1:15])
                 except ValueError:
                     return
+                af = afmil / 1000.0
                 o2r = raw_to_diag(s2r, CAL_O2)
                 o2c = raw_to_diag(s2c, CAL_O2)
                 nr = raw_to_diag(s1r, CAL_NOX)
@@ -379,7 +407,19 @@ class App:
                 self.nox_read.config(text=f"{nr:8.1f}")
                 self.nox_corr.config(text=f"{nc:8.1f}")
                 self.set_state(st, kmil)
-                self.log_sample(o2r, o2c, nr, nc, st, kmil)
+                # contadores do ciclo do piso
+                self.lbl_bite.config(text=f"{bite}")
+                self.lbl_pierce.config(
+                    text=f"{pierce}" + ("   (travado)" if blocked else ""))
+                ph = PHN[phase] if 0 <= phase < len(PHN) else str(phase)
+                extra = f"   {remain / 1000:.0f}s" if (phase in (0, 3) and remain > 0) else ""
+                self.lbl_phase.config(text=f"{af:.2f}   [{ph}]{extra}")
+                if bol:
+                    self.lbl_evt.config(text="BOLINHAS", foreground="#06c")
+                elif rst:
+                    self.lbl_evt.config(text="RESET", foreground="#b06a00")
+                self.log_sample(o2r, o2c, nr, nc, st, kmil,
+                                phase, af, remain, bite, pierce, blocked, bol, rst)
         elif line.startswith("CFG "):
             parts = line[4:].split(",")
             if len(parts) >= 5:
@@ -395,6 +435,8 @@ class App:
                     self._set(self.e_flr2, v[6])
                     self._set(self.e_hld, int(v[7]))
                     self._set(self.e_per, int(v[8]))
+                if len(parts) >= 10:
+                    self._set(self.e_mxf, int(v[9]))
 
     def _set(self, entry, val):
         entry.delete(0, "end")
