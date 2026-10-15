@@ -163,9 +163,11 @@ entra no conector CAN do **MCP2515** e o outro no conector do **CAN nativo**.
 
 Pinos usados pelo firmware (T-2CAN V1.0, **cristal do MCP2515 = 16 MHz**):
 `SPI SCLK=12 MOSI=11 MISO=13` · `MCP2515 CS=10 RST=9` · `TWAI TX=7 RX=6` ·
-`override físico = IO4` · `RESET de furadas = IO15` · `BOLINHAS = IO16`
+`override físico = IO4 (pad D3)` · `RESET de furadas = IO15 (pad D4)` ·
+`BOLINHAS = IO16 (pad D5)`
 (as três entradas são `INPUT_PULLUP`, ativas em nível baixo; deixe o override
-solto para operação normal).
+solto para operação normal). Os pads **D3/D4/D5** da serigrafia da placa
+correspondem, respectivamente, a **IO4/IO15/IO16**.
 
 ### Fiação do barramento (bornes da própria placa)
 
@@ -199,11 +201,11 @@ O override por hardware (força Bypass/Corrigindo) está no pad **`IO4`** da pla
 
 **Entradas extras na T-2CAN** (`INPUT_PULLUP`, ativas em nível baixo):
 
-- **`IO15` = RESET de furadas** — um **pulso ao GND** zera o contador de furadas
-  do Piso 1 (destrava o ciclo). Aqui um **botão momentâneo** serve bem (basta um
-  toque); também dá para usar o botão **"Zerar furadas"** da página.
-- **`IO16` = BOLINHAS** — um **pulso ao GND** registra o evento `BOLINHAS` no
-  log (igual ao Nano).
+- **`IO15` (pad **D4**) = RESET de furadas** — um **pulso ao GND** zera o contador
+  de furadas do Piso 1 (destrava o ciclo). Aqui um **botão momentâneo** serve bem
+  (basta um toque); também dá para usar o botão **"Zerar furadas"** da página.
+- **`IO16` (pad **D5**) = BOLINHAS** — um **pulso ao GND** registra o evento
+  `BOLINHAS` no log (igual ao Nano).
 
 ### Como usar (depois de gravar)
 
