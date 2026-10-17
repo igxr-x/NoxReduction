@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"D:\\\\Projetos\\\\Simulador\" -Recurse -File -Depth 2 | Where-Object { $_.Extension -in '.html','.js','.ts','.py','.ino','.jsx','.tsx','.vue','.json' } | Select-Object FullName | Format-Table -AutoSize -Wrap)"
+    ]
+  }
+}
