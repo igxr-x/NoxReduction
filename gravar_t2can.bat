@@ -14,6 +14,22 @@ REM ============================================================
 setlocal
 cd /d "%~dp0"
 
+REM ---- Verifica se o PlatformIO (pio) esta instalado ----
+where pio >nul 2>nul
+if %ERRORLEVEL% neq 0 (
+    echo PlatformIO ^(pio^) nao encontrado no PATH.
+    echo A plataforma ESP32 e as bibliotecas ^(mcp_can, WebSockets^) o PlatformIO
+    echo baixa sozinho na 1a compilacao, mas ele proprio precisa ser instalado antes:
+    echo(
+    echo   1^) Instale o Python ^(https://www.python.org/downloads/, marque "Add to PATH"^).
+    echo   2^) Abra um novo terminal e rode:  pip install -U platformio
+    echo   3^) Feche e reabra o terminal e rode este .bat de novo.
+    echo(
+    echo   Alternativa: instale a extensao "PlatformIO IDE" no VS Code.
+    pause
+    exit /b 1
+)
+
 REM ---- Porta: argumento ou auto-deteccao ----
 set "PORT=%~1"
 if "%PORT%"=="" (
