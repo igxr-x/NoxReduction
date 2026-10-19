@@ -47,9 +47,9 @@ const uint8_t PIN_SCLK = 12, PIN_MOSI = 11, PIN_MISO = 13;
 const uint8_t MCP_CS = 10, MCP_RST = 9;    // MCP_INT (8) nao usado (polling)
 const gpio_num_t TWAI_TX = GPIO_NUM_7, TWAI_RX = GPIO_NUM_6;
 const uint8_t D3_PIN = 4;                  // override por hardware (opcional)
-// Entradas extras (INPUT_PULLUP; "negativo" = aterrar o pino = LOW):
+// Entrada extra (INPUT_PULLUP; "negativo" = aterrar o pino = LOW):
 const uint8_t RESET_PIN    = 15;  // negativo -> zera o contador de FURADAS do Piso 1
-const uint8_t BOLINHAS_PIN = 16;  // negativo -> marca o evento "BOLINHAS" no log
+const uint8_t BOLINHAS_PIN = 16;  // SAIDA: normalmente HIGH; pulso negativo (LOW 500ms) a cada FURADA do Piso 1
 
 // ---------------------------------------------------------------------------
 // Wi-Fi (Access Point proprio - nao precisa de roteador no veiculo)
@@ -59,7 +59,7 @@ const char *AP_PASS = "11021992";          // >= 8 caracteres; troque se quiser
 
 const uint32_t TARGET_ID  = 0x18F00F52;    // frame a corrigir (estendido)
 const uint16_t TELEM_MS   = 100;           // periodo da telemetria
-const uint32_t CFG_MAGIC  = 0x43414E38;    // "CAN8" - marca de EEPROM valida (cresceu: max_pierces)
+const uint32_t CFG_MAGIC  = 0x43414E39;    // "CAN9" - marca de EEPROM valida (cresceu: can_timeout_ms)
 
 // ---- Calibracao FIXA raw -> diag (raw0, dref, rref) ----
 const float NOX_RAW0 = 4000.0f,  NOX_DREF = 100.0f, NOX_RREF = 6000.0f;   // NOx
@@ -137,6 +137,7 @@ struct Config {
   uint32_t floor_hold_ms;  // tempo X: quanto segura no Piso 2 (conta ao atingi-lo)
   uint32_t floor_period_ms;// tempo Y: quanto segura no Piso 1 entre mergulhos
   uint32_t max_pierces;    // limite de FURADAS do Piso 1 (0 = sem limite); zera com RESET
+  uint32_t can_timeout_ms; // sem frame do sensor por mais que isso -> marca TIMEOUT no log (0 = desliga)
 };
 
 Config cfg;
@@ -144,6 +145,7 @@ Config cfg;
 // Estado ao vivo
 uint16_t s1Read = 0, s1Corr = 0, s2Read = 0, s2Corr = 0;
 bool hasData = false;
+unsigned long lastSensorMs = 0;      // millis() do ultimo frame do sensor (TARGET_ID)
 float lastO2Diag = 1e9f;
 float k = 0.0f;
 bool correctActive = false;
@@ -151,24 +153,37 @@ unsigned long lastTelem = 0;
 unsigned long lastRamp = 0;
 
 // Ciclo do Piso 2 (Piso1 <-> Piso2 no tempo, so quando corrigindo)
-//   FP_WAIT: venceu Y batendo no Piso 1 -> aguarda sair do Piso 1 e voltar a bater
+//   FP_WAIT: venceu o tempo Y -> AGUARDA o O2 encostar/furar o Piso 1 p/ mergulhar
 enum FloorPhase { FP_HOLD1, FP_WAIT, FP_DOWN, FP_HOLD2, FP_UP };
 uint8_t floorPhase = FP_HOLD1;
 float activeFloor = 0.0f;            // piso em vigor no instante (o que o reforco usa)
-unsigned long floorPhaseT0 = 0;      // inicio da fase atual (p/ contar X e Y)
+unsigned long floorPhaseT0 = 0;      // inicio da fase atual (usado p/ contar X no Piso 2)
+unsigned long yT0 = 0;               // inicio da contagem Y (Piso 1); so zera ao FURAR
 unsigned long lastFloorMs = 0;
 bool floorBiting = false;            // O2 corrigido batendo no Piso 1 (reforco atuando)
-bool floorReleased = false;          // no FP_WAIT: ja saiu de cima do Piso 1?
 
 // Contadores (vao para a telemetria/log)
 uint32_t biteCount = 0;              // quantas vezes BATEU no Piso 1 (borda de floorBiting)
 uint32_t pierceCount = 0;            // quantas vezes FUROU o Piso 1 (mergulhos iniciados)
 bool pierceBlocked = false;          // atingiu max_pierces -> segura no Piso 1 ate o RESET
 
-// Entradas extras (borda de descida = evento) + pulsos latched p/ a telemetria
-bool prevResetLow = false, prevBolinhasLow = false;
+// Entrada RESET (borda de descida = evento) + pulso latched p/ a telemetria
+bool prevResetLow = false;
 bool resetEvent = false;             // pulso: RESET disparado desde o ultimo telem
-bool bolinhasEvent = false;          // pulso: BOLINHAS disparado desde o ultimo telem
+
+// Saida BOLINHAS: fica HIGH e cai p/ LOW por 500ms a cada FURADA do Piso 1.
+const uint32_t BOLINHAS_PULSE_MS = 500;
+unsigned long bolinhasPulseUntil = 0;  // millis() ate quando o pino fica LOW (0 = HIGH)
+uint32_t prevPierceCount = 0;          // detecta nova furada p/ disparar o pulso
+
+// Rede (Wi-Fi AP + web). Sobe SO DEPOIS do CAN ja estar repassando os frames,
+// pra nao "roubar" a janela de key-on: o sensor NOx precisa do handshake de
+// aquecimento (comando da ECU) logo ao ligar, e com o barramento CORTADO esse
+// frame so cruza se o bridge ja estiver no ar. Bloquear o setup() subindo o
+// softAP antes deixava os dois lados desconectados nesse instante critico.
+bool netStarted = false;               // Wi-Fi/web ja foi inicializado?
+unsigned long canReadyMs = 0;          // millis() em que o CAN ficou pronto
+const uint32_t NET_START_DELAY_MS = 2500;  // ms repassando o CAN antes de subir o Wi-Fi
 
 // Prototipos
 void loadConfig();
@@ -181,6 +196,7 @@ void updateRamp();
 void updateFloorCycle();
 void updateInputs();
 void resetPierces();
+void startNetwork();
 
 // Abstracao dos dois canais CAN (assinatura unica p/ o bridge) --------------
 typedef bool (*RecvFn)(uint32_t &id, uint8_t &ext, uint8_t &len, uint8_t *buf);
@@ -219,9 +235,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(D3_PIN, INPUT_PULLUP);
   pinMode(RESET_PIN, INPUT_PULLUP);
-  pinMode(BOLINHAS_PIN, INPUT_PULLUP);
-  prevResetLow    = (digitalRead(RESET_PIN) == LOW);     // nao dispara evento ao ligar
-  prevBolinhasLow = (digitalRead(BOLINHAS_PIN) == LOW);
+  pinMode(BOLINHAS_PIN, OUTPUT); digitalWrite(BOLINHAS_PIN, HIGH);  // saida: repouso em HIGH
+  prevResetLow = (digitalRead(RESET_PIN) == LOW);        // nao dispara evento ao ligar
   pinMode(MCP_RST, OUTPUT); digitalWrite(MCP_RST, HIGH);  // MCP2515 fora do reset
 
   EEPROM.begin(sizeof(Config) + 16);   // EEPROM emulada na flash do ESP32
@@ -245,7 +260,23 @@ void setup() {
     Serial.println(F("ERRO TWAI (CAN nativo) - verifique TX=7/RX=6"));
   }
 
-  // ---- Wi-Fi Access Point + servidores web ----
+  // NAO sobe o Wi-Fi/web aqui: isso fica para startNetwork(), chamado pelo loop()
+  // so depois do CAN ja estar repassando (ver NET_START_DELAY_MS). Subir o softAP
+  // dentro do setup() deixava os dois lados do barramento CORTADO desconectados
+  // justo na janela de key-on, perdendo o handshake de aquecimento do sensor NOx.
+
+  lastRamp = millis();
+  lastSensorMs = millis();
+  lastFloorMs = floorPhaseT0 = yT0 = millis();
+  activeFloor = cfg.o2_floor;
+  randomSeed(micros());   // semente p/ a oscilacao aleatoria do piso
+  canReadyMs = millis();  // CAN pronto: a partir daqui o loop() ja repassa frames
+  Serial.println(F("PRONTO: bridge CAN 250kbps (MCP2515=leitura  TWAI=saida)"));
+}
+
+// Sobe o Wi-Fi AP + servidor web + WebSocket. Chamado UMA vez pelo loop(), apos
+// NET_START_DELAY_MS repassando o CAN (fora da janela de key-on do sensor NOx).
+void startNetwork() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print(F("Wi-Fi AP \"")); Serial.print(AP_SSID);
@@ -256,17 +287,16 @@ void setup() {
   http.begin();
   ws.begin();
   ws.onEvent(onWsEvent);
-
-  lastRamp = millis();
-  lastFloorMs = floorPhaseT0 = millis();
-  activeFloor = cfg.o2_floor;
-  randomSeed(micros());   // semente p/ a oscilacao aleatoria do piso
-  Serial.println(F("PRONTO: bridge CAN 250kbps (MCP2515=leitura  TWAI=saida)"));
+  netStarted = true;
 }
 
 void loop() {
-  http.handleClient();
-  ws.loop();
+  unsigned long now = millis();
+  // Sobe o Wi-Fi/web so depois de NET_START_DELAY_MS repassando o CAN, para nao
+  // ocupar o setup/loop com o softAP durante a janela de key-on do sensor NOx.
+  if (!netStarted && now - canReadyMs >= NET_START_DELAY_MS) startNetwork();
+  if (netStarted) { http.handleClient(); ws.loop(); }
+
   updateInputs();
   updateRamp();
   updateFloorCycle();
@@ -276,36 +306,46 @@ void loop() {
   // Diagnostico(TWAI) -> Sensor(MCP2515): repasse puro
   pumpBus(twaiRecv, mcpSend, false);
 
-  unsigned long now = millis();
+  now = millis();
   if (hasData && now - lastTelem >= TELEM_MS) {
     lastTelem = now;
     int kmil = (int)(k * 1000.0f + 0.5f);
     int afMil = (int)(activeFloor * 1000.0f + 0.5f);     // piso em vigor (x1000)
-    unsigned long el = now - floorPhaseT0, remain = 0;   // tempo restante na fase
-    if (floorPhase == FP_HOLD1 && !pierceBlocked) remain = (el < cfg.floor_period_ms) ? cfg.floor_period_ms - el : 0;
-    else if (floorPhase == FP_HOLD2) remain = (el < cfg.floor_hold_ms) ? cfg.floor_hold_ms - el : 0;
-    int bolP = bolinhasEvent ? 1 : 0, rstP = resetEvent ? 1 : 0;
-    bolinhasEvent = resetEvent = false;                  // consome os pulsos
-    char line[112];
+    unsigned long remain = 0;                            // tempo restante na fase
+    if (floorPhase == FP_HOLD1 && !pierceBlocked) {      // contagem Y no Piso 1 (yT0 proprio)
+      unsigned long el = now - yT0;
+      remain = (el < cfg.floor_period_ms) ? cfg.floor_period_ms - el : 0;
+    } else if (floorPhase == FP_HOLD2) {                 // contagem X no Piso 2
+      unsigned long el = now - floorPhaseT0;
+      remain = (el < cfg.floor_hold_ms) ? cfg.floor_hold_ms - el : 0;
+    }
+    int rstP = resetEvent ? 1 : 0;
+    resetEvent = false;                                  // consome o pulso
+    // TIMEOUT: sem frame do sensor ha mais que can_timeout_ms (0 = desligado)
+    int toP = (cfg.can_timeout_ms > 0 && (now - lastSensorMs) > cfg.can_timeout_ms) ? 1 : 0;
+    char line[120];
     snprintf(line, sizeof(line), "T %u %u %u %u %d %d %u %d %lu %lu %lu %d %d %d",
              s1Read, s1Corr, s2Read, s2Corr, correctActive ? 1 : 0, kmil,
              floorPhase, afMil, remain, (unsigned long)biteCount,
-             (unsigned long)pierceCount, pierceBlocked ? 1 : 0, bolP, rstP);
-    ws.broadcastTXT(line);
+             (unsigned long)pierceCount, pierceBlocked ? 1 : 0, rstP, toP);
+    if (netStarted) ws.broadcastTXT(line);
   }
 }
 
-// Le as entradas extras (RESET e BOLINHAS), ambas INPUT_PULLUP -> ativas em
-// nivel BAIXO. Dispara na BORDA de descida (aterrou agora). RESET zera as
-// furadas (liberando novos mergulhos); BOLINHAS so marca um evento no log.
+// Le a entrada RESET (INPUT_PULLUP -> ativa em nivel BAIXO; dispara na BORDA de
+// descida) que zera as furadas. Em seguida gera a saida BOLINHAS: a cada nova
+// FURADA do Piso 1 (pierceCount subiu) da um pulso LOW de 500ms; repouso em HIGH.
 void updateInputs() {
   bool rLow = (digitalRead(RESET_PIN) == LOW);
   if (rLow && !prevResetLow) resetPierces();
   prevResetLow = rLow;
 
-  bool bLow = (digitalRead(BOLINHAS_PIN) == LOW);
-  if (bLow && !prevBolinhasLow) bolinhasEvent = true;
-  prevBolinhasLow = bLow;
+  unsigned long now = millis();
+  if (pierceCount != prevPierceCount) {       // nova furada (ou RESET zerou o contador)
+    if (pierceCount > prevPierceCount) bolinhasPulseUntil = now + BOLINHAS_PULSE_MS;
+    prevPierceCount = pierceCount;
+  }
+  digitalWrite(BOLINHAS_PIN, (bolinhasPulseUntil && now < bolinhasPulseUntil) ? LOW : HIGH);
 }
 
 // Zera o contador de furadas e destrava o ciclo (pode furar de novo). Marca o
@@ -323,14 +363,12 @@ void updateRamp() {
   lastRamp = now;
 
   bool d3low = (digitalRead(D3_PIN) == LOW);
-  bool target;
-  if (d3low && cfg.d3_low_bypass) {
-    target = false;                          // D3 baixo em modo Bypass: forca bypass total
-  } else {
-    // Normal (D3 solto) e tambem D3 baixo em modo "Corrigindo": segue o trigger de
-    // O2 - so corrige quando O2 < trigger, entrando/saindo do bypass por ele.
-    target = (lastO2Diag < cfg.o2_trigger);
-  }
+  // O D3 e' um HABILITADOR externo da correcao; o modo escolhe a polaridade:
+  //   "Bypass"     (d3_low_bypass=1): D3 negativo DESLIGA (bypass) ; solto -> habilita.
+  //   "Corrigindo" (d3_low_bypass=0): D3 negativo HABILITA         ; solto -> bypass.
+  // Quando habilitado, segue o trigger de O2 (so corrige com O2 < trigger).
+  bool d3allow = cfg.d3_low_bypass ? !d3low : d3low;
+  bool target = d3allow && (lastO2Diag < cfg.o2_trigger);
   correctActive = target;
 
   float goal = target ? 1.0f : 0.0f;
@@ -344,18 +382,17 @@ void updateRamp() {
 }
 
 // Ciclo do Piso 2: enquanto esta corrigindo (dentro do trigger) e o Piso 2 for
-// valido (0 < piso2 < piso1), o piso em vigor (activeFloor) mergulha NO TEMPO,
-// mas so entra no Piso 2 quando NAO esta batendo no Piso 1 (floorBiting):
-//   HOLD1 -> segura no Piso 1 por Y (floor_period_ms). Vencido Y:
-//              nao batendo -> DOWN ja ; batendo -> FP_WAIT (adia o mergulho).
-//   WAIT  -> segura no Piso 1 ate' SAIR de cima dele (parar de bater) e, na
-//            PROXIMA vez que voltar a bater, mergulha (DOWN).
+// valido (0 < piso2 < piso1), o piso em vigor (activeFloor) mergulha NO TEMPO:
+//   HOLD1 -> segura no Piso 1 contando Y (floor_period_ms). Vencido Y -> WAIT.
+//   WAIT  -> AGUARDA (segue no Piso 1) ate' o O2 encostar/FURAR o Piso 1
+//            (floorBiting). Ao furar: mergulha (DOWN) e REINICIA Y nesse instante.
 //   DOWN  -> tira a correcao em rampa ate o Piso 2.
 //   HOLD2 -> segura no Piso 2 por X (floor_hold_ms; conta a partir de atingi-lo)
 //   UP    -> incrementa a correcao em rampa, subindo ate o Piso 1 -> HOLD1.
-// Fora do trigger (bypass) o ciclo pausa/zera: volta pro Piso 1. A rampa entre
-// pisos reusa o mesmo tempo de rampa (ramp_ms). A oscilacao pequena do piso
-// continua sendo aplicada POR CIMA de activeFloor (em pumpBus).
+// O contador Y (yT0) so REINICIA na furada CONTROLADA (corrigindo). Em bypass o Y
+// NAO reinicia e CONTINUA contando ate "aguardando"; la a furada vale NA HORA que o
+// O2 cruza o Piso 1 (IGNORA o Y - ver pumpBus): conta e pulsa a saida BOLINHAS, sem
+// mergulhar. A rampa entre pisos reusa ramp_ms; a oscilacao do piso vem POR CIMA.
 void updateFloorCycle() {
   unsigned long now = millis();
   unsigned long dt = now - lastFloorMs;
@@ -363,20 +400,26 @@ void updateFloorCycle() {
 
   float piso1 = cfg.o2_floor;
   float piso2 = cfg.o2_floor2;
-  bool cycleOn = correctActive && piso1 > 0.0f && piso2 > 0.0f && piso2 < piso1;
+  bool cycleValid = piso1 > 0.0f && piso2 > 0.0f && piso2 < piso1;  // Piso 2 configurado
 
-  // Atingiu o limite de furadas? (0 = sem limite). Enquanto travado, segura no
-  // Piso 1 e nao mergulha ate' vir o RESET (pino negativo ou comando RSF).
+  // Atingiu o limite de furadas? (0 = sem limite). Enquanto travado, nao mergulha
+  // (fica AGUARDANDO no Piso 1) ate' vir o RESET (pino negativo ou comando RSF).
   bool canPierce = (cfg.max_pierces == 0) || (pierceCount < cfg.max_pierces);
   pierceBlocked = !canPierce;
 
-  if (!cycleOn) {                 // sem ciclo: fica no Piso 1 (comportamento antigo)
+  if (!cycleValid) {              // Piso 2 desligado -> sem ciclo, fica no Piso 1
     floorPhase = FP_HOLD1;
-    floorPhaseT0 = now;
-    floorReleased = false;
+    yT0 = now;                    // sem ciclo o Y nao conta
     activeFloor = piso1;
     return;
   }
+
+  // Em BYPASS (fora do trigger) a FURADA ainda vale (conta e pulsa a saida
+  // BOLINHAS), mas o MERGULHO em si nao e' aplicado: aborta um mergulho em curso
+  // de volta ao Piso 1. O contador Y segue correndo (FP_HOLD1 abaixo).
+  if (!correctActive &&
+      (floorPhase == FP_DOWN || floorPhase == FP_HOLD2 || floorPhase == FP_UP))
+    floorPhase = FP_HOLD1;
 
   // passo da rampa do piso (unidades de O2/ms); ramp_ms==0 -> transicao instantanea
   float step = (cfg.ramp_ms == 0) ? 1e9f
@@ -385,23 +428,14 @@ void updateFloorCycle() {
   switch (floorPhase) {
     case FP_HOLD1:
       activeFloor = piso1;
-      if (now - floorPhaseT0 >= cfg.floor_period_ms) {       // venceu Y
-        if (!canPierce) {
-          floorPhaseT0 = now;                                // travado: segura no Piso 1
-        } else if (!floorBiting) {
-          floorPhase = FP_DOWN; pierceCount++;               // livre -> FUROU (mergulha)
-        } else {
-          floorPhase = FP_WAIT;                              // batendo -> adia
-          floorReleased = false;
-        }
-      }
+      if (now - yT0 >= cfg.floor_period_ms) floorPhase = FP_WAIT;  // venceu Y (conta ate em bypass) -> aguarda furar
       break;
-    case FP_WAIT:
-      activeFloor = piso1;                                   // segue no Piso 1
-      if (!floorReleased) {
-        if (!floorBiting) floorReleased = true;              // saiu de cima do Piso 1
-      } else if (floorBiting) {
-        floorPhase = FP_DOWN; pierceCount++;                 // voltou a bater -> FUROU
+    case FP_WAIT:                              // AGUARDA o O2 encostar/furar o Piso 1
+      activeFloor = piso1;
+      if (correctActive && canPierce && floorBiting) {  // furada CONTROLADA (corrigindo): respeita o Y
+        floorPhase = FP_DOWN;
+        pierceCount++;                         // conta a furada + dispara o pulso de saida
+        yT0 = now;                             // reinicia Y JA no instante da furada
       }
       break;
     case FP_DOWN:
@@ -418,10 +452,9 @@ void updateFloorCycle() {
       break;
     case FP_UP:
       activeFloor += step;
-      if (activeFloor >= piso1) {              // voltou ao Piso 1 (ou acima)
+      if (activeFloor >= piso1) {              // voltou ao Piso 1 (Y segue correndo desde a furada)
         activeFloor = piso1;
         floorPhase = FP_HOLD1;
-        floorPhaseT0 = now;                    // recomeca Y
       }
       break;
   }
@@ -454,7 +487,13 @@ void pumpBus(RecvFn recv, SendFn send, bool applyCorrection) {
       // (rawToDiag e' linear -> O2 corrigido diag = o2d * (1 + ganho/100).)
       float o2baseCorr = o2d * (1.0f + (g * k) / 100.0f);
       bool nowBiting = (cfg.o2_floor > 0.0f) && (o2baseCorr < cfg.o2_floor);
-      if (nowBiting && !floorBiting) biteCount++;   // conta a BORDA (comecou a bater)
+      if (nowBiting && !floorBiting) {              // borda: comecou a bater no Piso 1
+        biteCount++;
+        // Em BYPASS a furada vale NA HORA, IGNORANDO o tempo Y: conta e pulsa a
+        // saida BOLINHAS. Nao mergulha (nao ha correcao em bypass) nem reseta o Y.
+        if (!correctActive && ((cfg.max_pierces == 0) || (pierceCount < cfg.max_pierces)))
+          pierceCount++;
+      }
       floorBiting = nowBiting;
 
       if (activeFloor > 0.0f && o2d > 0.01f) {
@@ -472,6 +511,7 @@ void pumpBus(RecvFn recv, SendFn send, bool applyCorrection) {
       s1Read = r1; s1Corr = c1;
       s2Read = r2; s2Corr = c2;
       hasData = true;
+      lastSensorMs = millis();   // recebeu frame do sensor -> arma/rearma o timeout
     }
     send(id, ext, len, buf);
   }
@@ -505,6 +545,7 @@ void loadConfig() {
     cfg.floor_hold_ms   = 5000;   // X: 5 s no Piso 2
     cfg.floor_period_ms = 60000;  // Y: 60 s no Piso 1 entre mergulhos
     cfg.max_pierces     = 1;      // por padrao fura 1x e trava ate o RESET
+    cfg.can_timeout_ms  = 2000;   // 2 s sem dados do sensor -> TIMEOUT
     saveConfig();
   }
 }
@@ -516,12 +557,13 @@ void saveConfig() {
 
 // Envia a config atual para TODOS os clientes web conectados.
 void sendConfig() {
-  char line[144];
-  snprintf(line, sizeof(line), "CFG %.3f,%.3f,%.3f,%lu,%u,%u,%.3f,%lu,%lu,%lu",
+  char line[160];
+  snprintf(line, sizeof(line), "CFG %.3f,%.3f,%.3f,%lu,%u,%u,%.3f,%lu,%lu,%lu,%lu",
            cfg.pct, cfg.o2_trigger, cfg.o2_floor,
            (unsigned long)cfg.ramp_ms, cfg.d3_low_bypass, cfg.prop_band,
            cfg.o2_floor2, (unsigned long)cfg.floor_hold_ms,
-           (unsigned long)cfg.floor_period_ms, (unsigned long)cfg.max_pierces);
+           (unsigned long)cfg.floor_period_ms, (unsigned long)cfg.max_pierces,
+           (unsigned long)cfg.can_timeout_ms);
   ws.broadcastTXT(line);
 }
 
@@ -539,6 +581,7 @@ void handleLine(char *line) {
   if (strncmp(line, "HLD:", 4) == 0) { cfg.floor_hold_ms   = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
   if (strncmp(line, "PER:", 4) == 0) { cfg.floor_period_ms = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
   if (strncmp(line, "MXF:", 4) == 0) { cfg.max_pierces     = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
+  if (strncmp(line, "TMO:", 4) == 0) { cfg.can_timeout_ms  = (uint32_t)atol(line + 4); saveConfig(); sendConfig(); return; }
   if (strcmp(line, "RSF") == 0)      { resetPierces(); return; }   // zera furadas (botao da UI)
 }
 
@@ -605,7 +648,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
     <div class="read"><span>NOx (ppm) &mdash; Corrigido</span><span class="v c" id="noc">---</span></div>
     <canvas id="chart" width="600" height="170"></canvas>
     <div class="hint">grafico do O2 &mdash; azul = lido, verde = corrigido &middot;
-      marcas: <b style="color:#e04">furou</b> / <b style="color:#3b82f6">BOLINHAS</b> / <b style="color:#ffb020">RESET</b></div>
+      marcas: <b style="color:#e04">furou</b> / <b style="color:#ffb020">RESET</b></div>
   </div>
 
   <div class="card">
@@ -632,11 +675,13 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
       <input id="per" type="number" step="1"></div>
     <div class="row"><label>M&aacute;x. furadas do Piso 1 (0 = sem limite)</label>
       <input id="mxf" type="number" step="1"></div>
+    <div class="row"><label>Timeout sem dados do sensor (ms) &mdash; 0 desliga</label>
+      <input id="tmo" type="number" step="1"></div>
     <div class="row"><label>Rampa (ms)</label>
       <input id="rmp" type="number" step="1"></div>
     <div class="row"><label>Correcao</label>
       <select id="prp"><option value="0">Fixa (piso oscila)</option><option value="1">Proporcional a faixa</option></select></div>
-    <div class="row"><label>D3 negativo (pino em nivel baixo)</label>
+    <div class="row"><label>IO4 negativo (pino em nivel baixo)</label>
       <select id="d3"><option value="1">Bypass</option><option value="0">Corrigindo</option></select></div>
     <div class="row"><button onclick="applyAll()">Aplicar tudo</button>
       <button class="sec" onclick="resetFuros()">Zerar furadas</button>
@@ -650,7 +695,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
       <button id="logbtn" class="sec" onclick="toggleLog()">Gravar log</button>
       <span id="logst" class="hint">log parado</span>
     </div>
-    <div class="hint">gera um .csv (mesmas colunas do app antigo) para abrir no log_viewer.html</div>
+    <div class="hint">gera um .csv para abrir no log_viewer.html (inclui a coluna de TIMEOUT)</div>
   </div>
 </div>
 <script>
@@ -659,7 +704,7 @@ const CAL_O2=[23500,9.5,42000], CAL_NOX=[4000,100,6000];
 const d2=(raw,c)=>(raw-c[0])*c[1]/((c[2]-c[0])||1);
 const $=id=>document.getElementById(id);
 
-let ws, hist=[]; // hist: {r,c,furou,bol,rst} do O2 p/ o grafico
+let ws, hist=[]; // hist: {r,c,furou,rst} do O2 p/ o grafico
 let log=null, logT0=0, logN=0, rows=[];
 let lastPierce=0;                         // p/ detectar nova furada entre amostras
 const PHN=['Piso 1','aguardando','descendo','Piso 2','subindo'];
@@ -678,7 +723,7 @@ function handle(line){
     const p=line.split(' '); if(p.length<15) return;
     const s1r=+p[1],s1c=+p[2],s2r=+p[3],s2c=+p[4],st=+p[5],kmil=+p[6];
     const phase=+p[7], af=(+p[8])/1000, remain=+p[9], bite=+p[10], pierce=+p[11],
-          blocked=+p[12], bol=+p[13], rst=+p[14];
+          blocked=+p[12], rst=+p[13], to=+p[14];
     const o2r=d2(s2r,CAL_O2),o2c=d2(s2c,CAL_O2),nor=d2(s1r,CAL_NOX),noc=d2(s1c,CAL_NOX);
     $('o2r').textContent=o2r.toFixed(2); $('o2c').textContent=o2c.toFixed(2);
     $('nor').textContent=nor.toFixed(1); $('noc').textContent=noc.toFixed(1);
@@ -688,11 +733,11 @@ function handle(line){
     $('pierce').textContent=pierce + (blocked?'  (travado)':'');
     $('cyc').textContent=af.toFixed(2)+'  ['+(PHN[phase]||phase)+']'+
       ((phase===0||phase===3)&&remain>0?'  '+(remain/1000).toFixed(0)+'s':'');
-    if(bol) $('evt').textContent='BOLINHAS'; else if(rst) $('evt').textContent='RESET';
+    if(to) $('evt').textContent='TIMEOUT (sem dados do sensor)'; else if(rst) $('evt').textContent='RESET';
     const furou = pierce>lastPierce; lastPierce=pierce;
-    hist.push({r:o2r,c:o2c,furou:furou,bol:!!bol,rst:!!rst});
+    hist.push({r:o2r,c:o2c,furou:furou,rst:!!rst,to:!!to});
     if(hist.length>240)hist.shift(); draw();
-    if(log) logSample(o2r,o2c,nor,noc,st,kmil,phase,af,remain,bite,pierce,blocked,bol,rst);
+    if(log) logSample(o2r,o2c,nor,noc,st,kmil,phase,af,remain,bite,pierce,blocked,rst,to);
   } else if(line.startsWith('CFG ')){
     const v=line.slice(4).split(',').map(Number);
     $('pct').value=v[0]; $('trg').value=v[1]; $('flr').value=v[2];
@@ -701,6 +746,7 @@ function handle(line){
     if(v.length>=6) $('prp').value = v[5]?'1':'0';
     if(v.length>=9){ $('flr2').value=v[6]; $('hld').value=Math.round(v[7]); $('per').value=Math.round(v[8]); }
     if(v.length>=10) $('mxf').value=Math.round(v[9]);
+    if(v.length>=11) $('tmo').value=Math.round(v[10]);
     checkBand();
   }
 }
@@ -719,6 +765,7 @@ function applyAll(){
   ap('FLR',$('flr').value); ap('FL2',$('flr2').value);
   ap('HLD',Math.round($('hld').value||0)); ap('PER',Math.round($('per').value||0));
   ap('MXF',Math.round($('mxf').value||0));
+  ap('TMO',Math.round($('tmo').value||0));
   ap('RMP',Math.round($('rmp').value||0));
   ap('PRP',$('prp').value); ap('D3',$('d3').value);
   checkBand();
@@ -742,32 +789,35 @@ function draw(){
   let lo=1e9,hi=-1e9; hist.forEach(p=>{lo=Math.min(lo,p.r,p.c);hi=Math.max(hi,p.r,p.c);});
   if(hi-lo<0.5){hi+=0.5;lo-=0.5;} const pad=(hi-lo)*0.1; lo-=pad; hi+=pad;
   const X=i=>i/(hist.length-1)*W, Y=v=>H-(v-lo)/(hi-lo)*H;
+  // faixa vermelha = TIMEOUT (sem dados do sensor)
+  x.fillStyle='rgba(224,16,16,0.14)';
+  hist.forEach((p,i)=>{ if(p.to){ const x0=X(i),x1=X(Math.min(i+1,hist.length-1)); x.fillRect(x0,0,(x1-x0)||2,H); } });
   const plot=(key,col)=>{ x.strokeStyle=col; x.lineWidth=2; x.beginPath();
     hist.forEach((p,i)=>{ i?x.lineTo(X(i),Y(p[key])):x.moveTo(X(i),Y(p[key])); }); x.stroke(); };
   plot('r','#3b82f6'); plot('c','#2ecc71');
   // marcas verticais dos eventos na linha do tempo
   const mark=(i,col)=>{ x.strokeStyle=col; x.lineWidth=1.5; x.beginPath();
     x.moveTo(X(i),0); x.lineTo(X(i),H); x.stroke(); };
-  hist.forEach((p,i)=>{ if(p.rst)mark(i,'#ffb020'); if(p.bol)mark(i,'#3b82f6'); if(p.furou)mark(i,'#e04'); });
+  hist.forEach((p,i)=>{ if(p.rst)mark(i,'#ffb020'); if(p.furou)mark(i,'#e04'); });
 }
 
 // log CSV no navegador
 function toggleLog(){ log? stopLog(): startLog(); }
 function startLog(){ rows=[]; logN=0; logT0=performance.now(); log=true;
   $('logbtn').textContent='Parar log'; $('logst').textContent='gravando... (0)'; }
-function logSample(o2r,o2c,nor,noc,st,kmil,phase,af,remain,bite,pierce,blocked,bol,rst){
+function logSample(o2r,o2c,nor,noc,st,kmil,phase,af,remain,bite,pierce,blocked,rst,to){
   const t=(performance.now()-logT0)/1000, trg=+$('trg').value||0,
         flr=+$('flr').value||0, flr2=+$('flr2').value||0,
         hld=Math.round($('hld').value||0), per=Math.round($('per').value||0);
   rows.push([t.toFixed(3),o2r.toFixed(3),o2c.toFixed(3),nor.toFixed(3),noc.toFixed(3),
              trg,flr,flr2,st,(kmil/10).toFixed(1),
              phase,af.toFixed(3),(remain/1000).toFixed(2),hld,per,
-             bite,pierce,blocked,bol,rst].join(','));
+             bite,pierce,blocked,rst,to].join(','));
   if(++logN%5===0) $('logst').textContent='gravando... ('+logN+')';
 }
 function stopLog(){ log=false; $('logbtn').textContent='Gravar log';
   const head='t_s,o2_read,o2_corr,nox_read,nox_corr,o2_trigger,o2_floor,o2_floor2,state,ramp_pct,'+
-             'phase,active_floor,phase_remain_s,hold_ms,period_ms,bite_count,pierce_count,blocked,bolinhas,reset\n';
+             'phase,active_floor,phase_remain_s,hold_ms,period_ms,bite_count,pierce_count,blocked,reset,timeout\n';
   const blob=new Blob([head+rows.join('\n')+'\n'],{type:'text/csv'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
   const d=new Date(), p=n=>String(n).padStart(2,'0');
