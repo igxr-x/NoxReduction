@@ -161,6 +161,12 @@ const float    OSC_SINE_MIX     = 0.25f; // peso da senoide residual; resto e' r
 const float    OSC_FAST_AMP     = 0.22f; // amplitude da oitava rapida somada por cima
 const float    TWO_PI_F         = 6.2831853f;
 
+// ---- Oscilacao do NOx CONGELADO (quando bate o piso) ----
+// Enquanto o reforco do piso atua (ver pumpBus), a conta -g levaria o NOx a
+// valores loucos (ate negativos). Em vez disso o NOx fica preso no ultimo valor
+// corrigido ANTES de bater o piso; esta oscilacao evita a linha reta no grafico.
+const float    NOX_OSC_FRAC     = 0.02f; // amplitude = +/- 2% do valor congelado
+
 // Um canal de value-noise suave: interpola (smoothstep) entre alvos aleatorios
 // em [0,1]. "stepMs" e' re-sorteado a cada alvo entre [minMs,maxMs] (min==max ->
 // passo fixo) para nao ficar periodico. O estado do canal vem por referencia
@@ -202,6 +208,16 @@ float floorOsc() {
   return osc;
 }
 
+// Oscilacao do NOx congelado (0..1). Canal de value-noise PROPRIO (nao divide
+// estado com o floorOsc do O2) para o NOx nao ficar oscilando colado no O2.
+float noxOsc() {
+  unsigned long now = millis();
+  static unsigned long nT0 = 0;
+  static uint32_t nStep = OSC_NOISE_MIN_MS;
+  static float nFrom = 0.5f, nTo = 0.5f;
+  return valueNoise(now, nT0, nStep, nFrom, nTo, OSC_NOISE_MIN_MS, OSC_NOISE_MAX_MS);
+}
+
 MCP_CAN CAN_READ(CS_READ);
 MCP_CAN CAN_SEND(CS_SEND);
 
@@ -224,6 +240,8 @@ Config cfg;
 // Estado ao vivo
 uint16_t s1Read = 0, s1Corr = 0, s2Read = 0, s2Corr = 0;
 bool hasData = false;
+uint16_t noxHeldRaw = 0;    // ultimo NOx corrigido (raw) antes de bater o piso
+bool     noxHeld    = false;// ja ha um valor memorizado p/ congelar?
 float lastO2Diag = 1e9f;      // O2 lido em diag (inicia "alto" -> bypass)
 float k = 0.0f;               // fator de rampa 0..1
 bool correctActive = false;   // alvo atual (trigger/D3): corrigindo?
@@ -503,6 +521,10 @@ void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection) {
         g = cfg.pct * p;
       }
 
+      // Ganho BASE do NOx (ja com a rampa), ANTES do reforco do piso: o NOx so
+      // usa esse ganho. O reforco do piso e' exclusivo do O2 (ver abaixo).
+      float gNox = g * k;
+
       // "Batendo no Piso 1": O2 corrigido so pela correcao BASE (sem o reforco,
       // ja com a rampa) ficaria abaixo do Piso 1 -> o reforco precisa atuar.
       // (rawToDiag e' linear -> O2 corrigido diag = o2d * (1 + ganho/100).)
@@ -516,15 +538,34 @@ void pumpBus(MCP_CAN &in, MCP_CAN &out, bool applyCorrection) {
       // ciclo do Piso 2 move no tempo), com o alvo oscilando um pouco acima
       // dele - inclusive quando a escala proporcional deixaria o ganho baixo
       // demais perto do trigger.
+      bool floorBoost = false;   // reforco do piso atuando? (empurra o O2 p/ o piso)
       if (activeFloor > 0.0f && o2d > 0.01f) {
         float tgt = activeFloor * (1.0f + OSC_AMP_FRAC * floorOsc()); // piso..piso+6%
         float gNeeded = 100.0f * (tgt / o2d - 1.0f);
-        if (gNeeded > g) g = gNeeded;         // reforca para nao baixar do piso
+        if (gNeeded > g) { g = gNeeded; floorBoost = true; } // reforca para nao baixar do piso
       }
       g *= k;                                  // aplica a rampa
 
-      uint16_t c1 = correct(r1, NOX_RAW0, -g); // NOx: diminui
-      uint16_t c2 = correct(r2, O2_RAW0,  +g); // O2 : aumenta
+      // O2: mantem TODA a logica (ganho base + reforco do piso + rampa).
+      uint16_t c2 = correct(r2, O2_RAW0, +g); // O2 : aumenta
+
+      // NOx: so o ganho BASE. Enquanto o reforco do piso atua, a conta -g levaria
+      // o NOx a valores loucos (ate negativos). Em vez disso CONGELA o ultimo NOx
+      // corrigido antes de bater o piso e deixa ele OSCILANDO (so NOx). Fora do
+      // reforco, corrige normalmente e memoriza o valor.
+      uint16_t c1;
+      if (floorBoost && noxHeld) {
+        float heldDiag = rawToDiag(noxHeldRaw, NOX_RAW0, NOX_DREF, NOX_RREF);
+        float diagOut  = heldDiag * (1.0f + NOX_OSC_FRAC * (2.0f * noxOsc() - 1.0f));
+        float den = NOX_RREF - NOX_RAW0; if (den == 0.0f) den = 1.0f;
+        float rawOut = NOX_RAW0 + diagOut * den / NOX_DREF;   // volta de diag -> raw
+        if (rawOut < 0.0f)       rawOut = 0.0f;
+        if (rawOut > 65535.0f)   rawOut = 65535.0f;
+        c1 = (uint16_t)(rawOut + 0.5f);
+      } else {
+        c1 = correct(r1, NOX_RAW0, -gNox);   // NOx: diminui (correcao normal)
+        noxHeldRaw = c1; noxHeld = true;     // memoriza o ultimo valor bom
+      }
       buf[0] = c1 & 0xFF; buf[1] = (c1 >> 8) & 0xFF;
       buf[2] = c2 & 0xFF; buf[3] = (c2 >> 8) & 0xFF;
 

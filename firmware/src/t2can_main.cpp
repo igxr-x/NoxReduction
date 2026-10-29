@@ -9,10 +9,11 @@
  *     Conecte o celular/notebook nessa rede e abra http://192.168.4.1
  *
  * Papel de cada canal (o barramento continua CORTADO em dois trechos):
- *   MCP2515 (SPI)  ->  LEITURA  (lado do sensor/ECU original)
- *   TWAI nativo    ->  SAIDA    (lado do diagnostico)
+ *   >>> CAN A <-> CAN B INVERTIDO (a entrada do sensor mudou de lado) <<<
+ *   TWAI nativo    ->  LEITURA  (lado do sensor/ECU original)
+ *   MCP2515 (SPI)  ->  SAIDA    (lado do diagnostico)
  *
- *   [Sensor/ECU] --> (MCP2515 LE) [T-2CAN corrige] (TWAI ENVIA) --> [Diag]
+ *   [Sensor/ECU] --> (TWAI LE) [T-2CAN corrige] (MCP2515 ENVIA) --> [Diag]
  *   Outros IDs: repassados nos dois sentidos, sem alteracao.
  *
  * TODA a matematica de correcao (ganho proporcional unico, trigger de O2,
@@ -59,6 +60,7 @@ const char *AP_PASS = "11021992";          // >= 8 caracteres; troque se quiser
 
 const uint32_t TARGET_ID  = 0x18F00F52;    // frame a corrigir (estendido)
 const uint16_t TELEM_MS   = 100;           // periodo da telemetria
+const uint32_t CAN_OK_MS  = 1500;          // sem frame nesse tempo -> CAN marcada "sem sinal"
 const uint32_t CFG_MAGIC  = 0x43414E39;    // "CAN9" - marca de EEPROM valida (cresceu: can_timeout_ms)
 
 // ---- Calibracao FIXA raw -> diag (raw0, dref, rref) ----
@@ -79,6 +81,12 @@ const uint32_t OSC_FAST_MS      = 450;   // passo da oitava rapida (textura)
 const float    OSC_SINE_MIX     = 0.25f; // peso da senoide residual; resto e' ruido lento
 const float    OSC_FAST_AMP     = 0.22f; // amplitude da oitava rapida somada por cima
 const float    TWO_PI_F         = 6.2831853f;
+
+// ---- Oscilacao do NOx CONGELADO (quando bate o piso) ----
+// Enquanto o reforco do piso atua (ver pumpBus), a conta -g levaria o NOx a
+// valores loucos (ate negativos). Em vez disso o NOx fica preso no ultimo valor
+// corrigido ANTES de bater o piso; esta oscilacao evita a linha reta no grafico.
+const float    NOX_OSC_FRAC     = 0.02f; // amplitude = +/- 2% do valor congelado
 
 // Um canal de value-noise suave: interpola (smoothstep) entre alvos aleatorios
 // em [0,1]. "stepMs" e' re-sorteado a cada alvo entre [minMs,maxMs] (min==max ->
@@ -121,6 +129,16 @@ float floorOsc() {
   return osc;
 }
 
+// Oscilacao do NOx congelado (0..1). Canal de value-noise PROPRIO (nao divide
+// estado com o floorOsc do O2) para o NOx nao ficar oscilando colado no O2.
+float noxOsc() {
+  unsigned long now = millis();
+  static unsigned long nT0 = 0;
+  static uint32_t nStep = OSC_NOISE_MIN_MS;
+  static float nFrom = 0.5f, nTo = 0.5f;
+  return valueNoise(now, nT0, nStep, nFrom, nTo, OSC_NOISE_MIN_MS, OSC_NOISE_MAX_MS);
+}
+
 MCP_CAN CAN_MCP(MCP_CS);          // lado do sensor/ECU (LEITURA)
 WebServer http(80);               // serve a pagina web
 WebSocketsServer ws(81);          // config + telemetria em tempo real
@@ -145,12 +163,35 @@ Config cfg;
 // Estado ao vivo
 uint16_t s1Read = 0, s1Corr = 0, s2Read = 0, s2Corr = 0;
 bool hasData = false;
+uint16_t noxHeldRaw = 0;    // ultimo NOx corrigido (raw) antes de bater o piso
+bool     noxHeld    = false;// ja ha um valor memorizado p/ congelar?
 unsigned long lastSensorMs = 0;      // millis() do ultimo frame do sensor (TARGET_ID)
 float lastO2Diag = 1e9f;
 float k = 0.0f;
 bool correctActive = false;
 unsigned long lastTelem = 0;
 unsigned long lastRamp = 0;
+
+// Diagnostico do lado TWAI (CAN B / diagnostico): conta os frames recebidos do
+// painel e deixa curar bus-off. Se twaiRxCount NAO sobe, o TWAI nao esta
+// recebendo nada do lado B (HW/fiacao/transceiver ou bus-off).
+volatile uint32_t twaiRxCount = 0;
+unsigned long lastTwaiLog = 0;
+
+// "Saude" de cada barramento para a UI: guarda o millis() do ultimo frame
+// recebido em cada canal fisico. CAN A = MCP2515, CAN B = TWAI. Se nao chega
+// frame ha mais que CAN_OK_MS, a CAN e' marcada como "sem sinal" na pagina.
+volatile uint32_t mcpRxCount = 0;    // frames recebidos no MCP2515 (CAN A)
+unsigned long lastMcpRxMs  = 0;      // millis() do ultimo frame no MCP2515 (CAN A)
+unsigned long lastTwaiRxMs = 0;      // millis() do ultimo frame no TWAI    (CAN B)
+
+// Recuperacao do MCP2515 (equivalente ao twaiHealth do lado TWAI). Com o CAN
+// INVERTIDO o MCP virou o lado que TRANSMITE (diagnostico): se o tester nao da
+// ACK (key-on / desconectado), os 3 buffers de TX enchem, o sendMsg fica girando
+// ate TIMEOUTVALUE e o loop() nao roda o mcpRecv -> CAN A fica muda. O one-shot
+// (setup) impede a tempestade de retransmissao; isto aqui cura o bus-off residual.
+uint32_t mcpRecoverCount = 0;        // quantas vezes o MCP foi re-inicializado
+unsigned long lastMcpHealth = 0;     // ultimo check de saude do MCP (throttle do SPI)
 
 // Ciclo do Piso 2 (Piso1 <-> Piso2 no tempo, so quando corrigindo)
 //   FP_WAIT: venceu o tempo Y -> AGUARDA o O2 encostar/furar o Piso 1 p/ mergulhar
@@ -197,6 +238,8 @@ void updateFloorCycle();
 void updateInputs();
 void resetPierces();
 void startNetwork();
+void twaiHealth();
+void mcpHealth();
 
 // Abstracao dos dois canais CAN (assinatura unica p/ o bridge) --------------
 typedef bool (*RecvFn)(uint32_t &id, uint8_t &ext, uint8_t &len, uint8_t *buf);
@@ -206,6 +249,7 @@ bool mcpRecv(uint32_t &id, uint8_t &ext, uint8_t &len, uint8_t *buf) {
   if (CAN_MCP.checkReceive() != CAN_MSGAVAIL) return false;
   unsigned long lid = 0; uint8_t e = 0, l = 0;
   if (CAN_MCP.readMsgBuf(&lid, &e, &l, buf) != CAN_OK) return false;
+  mcpRxCount++; lastMcpRxMs = millis();  // chegou frame no lado CAN A (MCP2515)
   id = lid; ext = e; len = l; return true;
 }
 void mcpSend(uint32_t id, uint8_t ext, uint8_t len, uint8_t *buf) {
@@ -214,6 +258,7 @@ void mcpSend(uint32_t id, uint8_t ext, uint8_t len, uint8_t *buf) {
 bool twaiRecv(uint32_t &id, uint8_t &ext, uint8_t &len, uint8_t *buf) {
   twai_message_t m;
   if (twai_receive(&m, 0) != ESP_OK) return false;
+  twaiRxCount++; lastTwaiRxMs = millis(); // chegou frame no lado CAN B (TWAI)
   id = m.identifier; ext = m.extd; len = m.data_length_code;
   for (int i = 0; i < len && i < 8; i++) buf[i] = m.data[i];
   return true;
@@ -223,6 +268,38 @@ void twaiSend(uint32_t id, uint8_t ext, uint8_t len, uint8_t *buf) {
   m.identifier = id; m.extd = ext ? 1 : 0; m.data_length_code = len;
   for (int i = 0; i < len && i < 8; i++) m.data[i] = buf[i];
   twai_transmit(&m, pdMS_TO_TICKS(2));
+}
+
+// Cura o TWAI se ele cair em bus-off (ex.: transmitiu dado do sensor no key-on
+// sem ninguem dando ACK ainda no lado do diagnostico). Sem isso o controlador
+// para TX e RX DE VEZ ate reiniciar - e o lado CAN B fica mudo o resto da
+// sessao. Chamado a cada volta do loop().
+void twaiHealth() {
+  twai_status_info_t st;
+  if (twai_get_status_info(&st) != ESP_OK) return;
+  if (st.state == TWAI_STATE_BUS_OFF) {
+    twai_initiate_recovery();            // inicia a recuperacao (128x11 bits recessivos)
+  } else if (st.state == TWAI_STATE_STOPPED) {
+    twai_start();                        // recuperou -> religa o controlador
+  }
+}
+
+// Cura o MCP2515 se ele cair em bus-off (TEC=255) - o lado CAN A, que agora
+// TRANSMITE para o tester. Diferente do TWAI, o MCP nao tem recuperacao propria
+// exposta, entao re-inicializamos o controlador (reset + reconfigura). Checado
+// ~10x/s porque cada getError/errorCount e' um acesso SPI. O one-shot (setup)
+// evita a tempestade que leva ao bus-off; aqui e' a rede de seguranca.
+void mcpHealth() {
+  unsigned long now = millis();
+  if (now - lastMcpHealth < 100) return;
+  lastMcpHealth = now;
+  uint8_t eflg = CAN_MCP.getError();           // EFLG: TXBO = bus-off
+  if ((eflg & MCP_EFLG_TXBO) || CAN_MCP.errorCountTX() >= 255) {
+    CAN_MCP.begin(MCP_ANY, CAN_250KBPS, MCP_16MHZ);  // soft-reset + reconfigura
+    CAN_MCP.setMode(MCP_NORMAL);
+    CAN_MCP.enOneShotTX();                            // mantem o one-shot apos o reset
+    mcpRecoverCount++;
+  }
 }
 
 void pumpBus(RecvFn recv, SendFn send, bool applyCorrection);
@@ -251,13 +328,26 @@ void setup() {
     okMcp = (CAN_MCP.begin(MCP_ANY, CAN_250KBPS, MCP_16MHZ) == CAN_OK);
   }
   CAN_MCP.setMode(MCP_NORMAL);
+  // ONE-SHOT: com o CAN invertido o MCP e' o lado que TRANSMITE para o tester.
+  // Sem one-shot, um frame sem ACK (key-on / tester desligado) e' retransmitido
+  // sem parar: os 3 buffers de TX enchem, o sendMsg gira ate TIMEOUTVALUE e o
+  // loop() para de ler o outro lado -> CAN A fica muda. Em one-shot cada frame e'
+  // tentado 1x e, falhando, o buffer e' liberado na hora (sem travar o loop).
+  CAN_MCP.enOneShotTX();
 
   // ---- TWAI / CAN nativo (lado do diagnostico) : 250 kbps ----
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX, TWAI_RX, TWAI_MODE_NORMAL);
   twai_timing_config_t  t = TWAI_TIMING_CONFIG_250KBITS();
   twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
-    Serial.println(F("ERRO TWAI (CAN nativo) - verifique TX=7/RX=6"));
+  // Repete ate' conseguir (igual ao MCP). Antes era so um println e o codigo
+  // SEGUIA com o TWAI morto -> lado CAN B mudo sem aviso em operacao normal.
+  bool okTwai = (twai_driver_install(&g, &t, &f) == ESP_OK) && (twai_start() == ESP_OK);
+  while (!okTwai) {
+    Serial.println(F("ERRO TWAI (CAN nativo) - verifique TX=7/RX=6 e o transceiver"));
+    twai_stop();                 // limpa um install parcial antes de tentar de novo
+    twai_driver_uninstall();
+    delay(1000);
+    okTwai = (twai_driver_install(&g, &t, &f) == ESP_OK) && (twai_start() == ESP_OK);
   }
 
   // NAO sobe o Wi-Fi/web aqui: isso fica para startNetwork(), chamado pelo loop()
@@ -301,13 +391,38 @@ void loop() {
   updateRamp();
   updateFloorCycle();
 
-  // Sensor(MCP2515) -> Diagnostico(TWAI): corrige o TARGET_ID
-  pumpBus(mcpRecv, twaiSend, true);
-  // Diagnostico(TWAI) -> Sensor(MCP2515): repasse puro
-  pumpBus(twaiRecv, mcpSend, false);
+  // [CAN A<->B INVERTIDO] Sensor(TWAI) -> Diagnostico(MCP2515): corrige o TARGET_ID
+  pumpBus(twaiRecv, mcpSend, true);
+  // [CAN A<->B INVERTIDO] Diagnostico(MCP2515) -> Sensor(TWAI): repasse puro
+  pumpBus(mcpRecv, twaiSend, false);
+  twaiHealth();                          // cura bus-off do lado CAN B (TWAI)
+  mcpHealth();                           // cura bus-off do lado CAN A (MCP2515)
 
   now = millis();
-  if (hasData && now - lastTelem >= TELEM_MS) {
+  // Diagnostico do lado CAN B no serial (1x/s), independente do sensor ja estar
+  // ligado. rx = frames recebidos do painel; estado 0=STOPPED 1=RUNNING
+  // 2=BUS_OFF 3=RECOVERING. Se rx NAO sobe, o TWAI nao recebe nada do painel.
+  if (now - lastTwaiLog >= 1000) {
+    lastTwaiLog = now;
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) == ESP_OK) {
+      Serial.printf("TWAI rx=%lu estado=%d tx_err=%lu rx_err=%lu tx_fail=%lu\n",
+                    (unsigned long)twaiRxCount, (int)st.state,
+                    (unsigned long)st.tx_error_counter,
+                    (unsigned long)st.rx_error_counter,
+                    (unsigned long)st.tx_failed_count);
+    }
+    // Diagnostico do MCP (CAN A): rx = frames recebidos; eflg = registrador de
+    // erro (0x20=bus-off); tec/rec = contadores de erro TX/RX; recover = quantas
+    // vezes o MCP foi re-inicializado. Se rx NAO sobe, CAN A nao recebe nada.
+    Serial.printf("MCP  rx=%lu eflg=0x%02X tec=%u rec=%u recover=%lu\n",
+                  (unsigned long)mcpRxCount, CAN_MCP.getError(),
+                  CAN_MCP.errorCountTX(), CAN_MCP.errorCountRX(),
+                  (unsigned long)mcpRecoverCount);
+  }
+  // Envia telemetria assim que a rede sobe (nao espera o 1o frame do sensor):
+  // assim o status "ok" de cada CAN ja aparece na pagina mesmo sem dados ainda.
+  if (netStarted && now - lastTelem >= TELEM_MS) {
     lastTelem = now;
     int kmil = (int)(k * 1000.0f + 0.5f);
     int afMil = (int)(activeFloor * 1000.0f + 0.5f);     // piso em vigor (x1000)
@@ -323,12 +438,16 @@ void loop() {
     resetEvent = false;                                  // consome o pulso
     // TIMEOUT: sem frame do sensor ha mais que can_timeout_ms (0 = desligado)
     int toP = (cfg.can_timeout_ms > 0 && (now - lastSensorMs) > cfg.can_timeout_ms) ? 1 : 0;
-    char line[120];
-    snprintf(line, sizeof(line), "T %u %u %u %u %d %d %u %d %lu %lu %lu %d %d %d",
+    // Status "ok" de cada barramento: recebeu frame ha menos de CAN_OK_MS?
+    int caOk = (lastMcpRxMs  && (now - lastMcpRxMs)  < CAN_OK_MS) ? 1 : 0; // CAN A (MCP2515)
+    int cbOk = (lastTwaiRxMs && (now - lastTwaiRxMs) < CAN_OK_MS) ? 1 : 0; // CAN B (TWAI)
+    char line[140];
+    snprintf(line, sizeof(line), "T %u %u %u %u %d %d %u %d %lu %lu %lu %d %d %d %d %d %d",
              s1Read, s1Corr, s2Read, s2Corr, correctActive ? 1 : 0, kmil,
              floorPhase, afMil, remain, (unsigned long)biteCount,
-             (unsigned long)pierceCount, pierceBlocked ? 1 : 0, rstP, toP);
-    if (netStarted) ws.broadcastTXT(line);
+             (unsigned long)pierceCount, pierceBlocked ? 1 : 0, rstP, toP,
+             caOk, cbOk, hasData ? 1 : 0);
+    ws.broadcastTXT(line);
   }
 }
 
@@ -482,6 +601,10 @@ void pumpBus(RecvFn recv, SendFn send, bool applyCorrection) {
         g = cfg.pct * p;
       }
 
+      // Ganho BASE do NOx (ja com a rampa), ANTES do reforco do piso: o NOx so
+      // usa esse ganho. O reforco do piso e' exclusivo do O2 (ver abaixo).
+      float gNox = g * k;
+
       // "Batendo no Piso 1": O2 corrigido so pela correcao BASE (sem o reforco,
       // ja com a rampa) ficaria abaixo do Piso 1 -> o reforco precisa atuar.
       // (rawToDiag e' linear -> O2 corrigido diag = o2d * (1 + ganho/100).)
@@ -496,15 +619,34 @@ void pumpBus(RecvFn recv, SendFn send, bool applyCorrection) {
       }
       floorBiting = nowBiting;
 
+      bool floorBoost = false;   // reforco do piso atuando? (empurra o O2 p/ o piso)
       if (activeFloor > 0.0f && o2d > 0.01f) {
         float tgt = activeFloor * (1.0f + OSC_AMP_FRAC * floorOsc());  // por cima do piso ativo
         float gNeeded = 100.0f * (tgt / o2d - 1.0f);
-        if (gNeeded > g) g = gNeeded;
+        if (gNeeded > g) { g = gNeeded; floorBoost = true; }
       }
       g *= k;
 
-      uint16_t c1 = correct(r1, NOX_RAW0, -g); // NOx: diminui
-      uint16_t c2 = correct(r2, O2_RAW0,  +g); // O2 : aumenta
+      // O2: mantem TODA a logica (ganho base + reforco do piso + rampa).
+      uint16_t c2 = correct(r2, O2_RAW0, +g); // O2 : aumenta
+
+      // NOx: so o ganho BASE. Enquanto o reforco do piso atua, a conta -g levaria
+      // o NOx a valores loucos (ate negativos). Em vez disso CONGELA o ultimo NOx
+      // corrigido antes de bater o piso e deixa ele OSCILANDO (so NOx). Fora do
+      // reforco, corrige normalmente e memoriza o valor.
+      uint16_t c1;
+      if (floorBoost && noxHeld) {
+        float heldDiag = rawToDiag(noxHeldRaw, NOX_RAW0, NOX_DREF, NOX_RREF);
+        float diagOut  = heldDiag * (1.0f + NOX_OSC_FRAC * (2.0f * noxOsc() - 1.0f));
+        float den = NOX_RREF - NOX_RAW0; if (den == 0.0f) den = 1.0f;
+        float rawOut = NOX_RAW0 + diagOut * den / NOX_DREF;   // volta de diag -> raw
+        if (rawOut < 0.0f)       rawOut = 0.0f;
+        if (rawOut > 65535.0f)   rawOut = 65535.0f;
+        c1 = (uint16_t)(rawOut + 0.5f);
+      } else {
+        c1 = correct(r1, NOX_RAW0, -gNox);   // NOx: diminui (correcao normal)
+        noxHeldRaw = c1; noxHeld = true;     // memoriza o ultimo valor bom
+      }
       buf[0] = c1 & 0xFF; buf[1] = (c1 >> 8) & 0xFF;
       buf[2] = c2 & 0xFF; buf[3] = (c2 >> 8) & 0xFF;
 
@@ -633,11 +775,30 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
   .hint{color:var(--mut);font-size:12px}
   .warn{color:#ffb020;font-size:13px;min-height:16px;margin-top:4px}
   canvas{width:100%;height:170px;background:#0e1116;border-radius:8px}
+  .cans{display:flex;gap:8px;margin:8px 0}
+  .pill{font-size:12px;font-weight:700;padding:3px 10px;border-radius:999px;border:1px solid var(--line)}
+  .pill.ok{background:rgba(46,204,113,.15);color:#2ecc71;border-color:#2ecc71}
+  .pill.bad{background:rgba(224,16,16,.15);color:#ff6b6b;border-color:#e04}
+  .tabs{display:flex;gap:6px;margin:12px 0 0}
+  .tab{background:#333c4a;color:var(--ink);border:0;border-radius:8px 8px 0 0;padding:8px 14px;cursor:pointer;font-size:14px;opacity:.55}
+  .tab.active{background:var(--card);opacity:1}
+  .pane.hidden{display:none}
 </style></head>
 <body><div class="wrap">
   <h1>Bridge CAN 18F00F52 &mdash; corretor de sensores</h1>
   <div id="conn" class="conn">status: <b>conectando&hellip;</b></div>
 
+  <div class="cans">
+    <span id="cana" class="pill bad">CAN A: &mdash;</span>
+    <span id="canb" class="pill bad">CAN B: &mdash;</span>
+  </div>
+
+  <div class="tabs">
+    <button id="tb-main" class="tab active" onclick="showTab('main')">Principal</button>
+    <button id="tb-adv"  class="tab"        onclick="showTab('adv')">Op&ccedil;&otilde;es avan&ccedil;adas</button>
+  </div>
+
+  <div id="pane-main" class="pane">
   <div id="banner" class="banner">AGUARDANDO</div>
 
   <div class="card">
@@ -679,10 +840,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
       <input id="tmo" type="number" step="1"></div>
     <div class="row"><label>Rampa (ms)</label>
       <input id="rmp" type="number" step="1"></div>
-    <div class="row"><label>Correcao</label>
-      <select id="prp"><option value="0">Fixa (piso oscila)</option><option value="1">Proporcional a faixa</option></select></div>
-    <div class="row"><label>IO4 negativo (pino em nivel baixo)</label>
-      <select id="d3"><option value="1">Bypass</option><option value="0">Corrigindo</option></select></div>
+    <div class="hint">Corre&ccedil;&atilde;o e IO4 ficam na aba &ldquo;Op&ccedil;&otilde;es avan&ccedil;adas&rdquo;.</div>
     <div class="row"><button onclick="applyAll()">Aplicar tudo</button>
       <button class="sec" onclick="resetFuros()">Zerar furadas</button>
       <span class="hint">grava os campos na EEPROM &middot; zerar libera novas furadas</span></div>
@@ -697,6 +855,20 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
     </div>
     <div class="hint">gera um .csv para abrir no log_viewer.html (inclui a coluna de TIMEOUT)</div>
   </div>
+  </div><!-- /pane-main -->
+
+  <div id="pane-adv" class="pane hidden">
+    <div class="card">
+      <h2>Op&ccedil;&otilde;es avan&ccedil;adas (listas)</h2>
+      <div class="hint" style="margin-bottom:10px">Separadas da tela principal para evitar toque acidental na correria.</div>
+      <div class="row"><label>Correcao</label>
+        <select id="prp"><option value="0">Fixa (piso oscila)</option><option value="1">Proporcional a faixa</option></select></div>
+      <div class="row"><label>IO4 negativo (pino em nivel baixo)</label>
+        <select id="d3"><option value="1">Bypass</option><option value="0">Corrigindo</option></select></div>
+      <div class="row"><button onclick="applyAll()">Aplicar op&ccedil;&otilde;es</button>
+        <span class="hint">grava Correcao e IO4 na EEPROM</span></div>
+    </div>
+  </div><!-- /pane-adv -->
 </div>
 <script>
 // Calibracao FIXA raw -> valor exibido (igual ao firmware)
@@ -720,14 +892,16 @@ function setConn(ok){ const c=$('conn'); c.className='conn'+(ok?' ok':'');
 
 function handle(line){
   if(line.startsWith('T ')){
-    const p=line.split(' '); if(p.length<15) return;
+    const p=line.split(' '); if(p.length<18) return;
     const s1r=+p[1],s1c=+p[2],s2r=+p[3],s2c=+p[4],st=+p[5],kmil=+p[6];
     const phase=+p[7], af=(+p[8])/1000, remain=+p[9], bite=+p[10], pierce=+p[11],
-          blocked=+p[12], rst=+p[13], to=+p[14];
+          blocked=+p[12], rst=+p[13], to=+p[14], caOk=+p[15], cbOk=+p[16], hd=+p[17];
+    setPill($('cana'),'CAN A',caOk); setPill($('canb'),'CAN B',cbOk);
+    banner(st,kmil,hd);
+    if(!hd) return;          // sem dados do sensor ainda: so atualiza status das CANs
     const o2r=d2(s2r,CAL_O2),o2c=d2(s2c,CAL_O2),nor=d2(s1r,CAL_NOX),noc=d2(s1c,CAL_NOX);
     $('o2r').textContent=o2r.toFixed(2); $('o2c').textContent=o2c.toFixed(2);
     $('nor').textContent=nor.toFixed(1); $('noc').textContent=noc.toFixed(1);
-    banner(st,kmil);
     // readouts do ciclo do piso
     $('bite').textContent=bite;
     $('pierce').textContent=pierce + (blocked?'  (travado)':'');
@@ -750,12 +924,26 @@ function handle(line){
     checkBand();
   }
 }
-function banner(st,kmil){
+function banner(st,kmil,hd){
   const b=$('banner');
+  if(!hd){ b.textContent='AGUARDANDO'; b.style.background='#333'; b.style.color='#bbb'; return; }
   if(st===1){ let t='CORRIGINDO'; if(kmil<999)t+=' (rampa '+(kmil/10).toFixed(0)+'%)';
               b.textContent=t; b.style.background='#0a7d2c'; b.style.color='#fff'; }
   else{ let t='BYPASS'; if(kmil>1)t+=' (rampa '+(kmil/10).toFixed(0)+'%)';
         b.textContent=t; b.style.background='#b06a00'; b.style.color='#fff'; }
+}
+// Status "ok" de cada barramento CAN (verde = recebendo frames; vermelho = sem sinal)
+function setPill(el,name,ok){
+  el.textContent=name+': '+(ok?'OK':'sem sinal');
+  el.className='pill '+(ok?'ok':'bad');
+}
+// Alterna entre a aba Principal e a de Opcoes avancadas (listas protegidas)
+function showTab(name){
+  const main = name==='main';
+  $('pane-main').classList.toggle('hidden',!main);
+  $('pane-adv').classList.toggle('hidden',main);
+  $('tb-main').classList.toggle('active',main);
+  $('tb-adv').classList.toggle('active',!main);
 }
 function ap(cmd,val){ if(ws&&ws.readyState===1) ws.send(cmd+':'+val); }
 // Botao unico: envia TODOS os campos (cada um grava na EEPROM no firmware).

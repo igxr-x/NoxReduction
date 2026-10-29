@@ -8,7 +8,8 @@
       "WebFetch(domain:wiki.lilygo.cc)",
       "WebFetch(domain:github.com)",
       "PowerShell(Get-ChildItem -Recurse -Depth 2 | Where-Object { -not $_.PSIsContainer } | Select-Object FullName, Length | Format-Table -AutoSize)",
-      "PowerShell(\\(Get-Content \"firmware\\\\src\\\\main.cpp\" | Measure-Object -Line\\).Lines; \\(Get-Content \"firmware\\\\src\\\\t2can_main.cpp\" | Measure-Object -Line\\).Lines)"
+      "PowerShell(\\(Get-Content \"firmware\\\\src\\\\main.cpp\" | Measure-Object -Line\\).Lines; \\(Get-Content \"firmware\\\\src\\\\t2can_main.cpp\" | Measure-Object -Line\\).Lines)",
+      "PowerShell($f=\"C:\\\\Users\\\\marlo\\\\Downloads\\\\log_20261015_095723.csv\"; $d=Import-Csv $f; \"linhas: $\\($d.Count\\)\"; \"nox_read distintos: \" + \\(\\($d.nox_read | Sort-Object -Unique\\) -join ', '\\); \"nox_corr distintos: \" + \\(\\($d.nox_corr | Sort-Object -Unique\\) -join ', '\\); \"o2_read distintos: \" + \\(\\($d.o2_read | Sort-Object -Unique\\) -join ', '\\); \"state distintos: \" + \\(\\($d.state | Sort-Object -Unique\\) -join ', '\\))"
     ]
   }
 }
