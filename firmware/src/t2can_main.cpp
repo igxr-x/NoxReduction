@@ -193,6 +193,18 @@ unsigned long lastTwaiRxMs = 0;      // millis() do ultimo frame no TWAI    (CAN
 uint32_t mcpRecoverCount = 0;        // quantas vezes o MCP foi re-inicializado
 unsigned long lastMcpHealth = 0;     // ultimo check de saude do MCP (throttle do SPI)
 
+// ONE-SHOT DINAMICO do MCP (lado que TRANSMITE para o diagnostico).
+// O one-shot tenta cada frame 1x e, falhando (perda de arbitragem / erro de bit),
+// DESCARTA sem retransmitir. Isso evita a tempestade de retransmissao no key-on
+// (tester sem dar ACK), mas EM MARCHA derruba o frame da sonda de vez em quando
+// quando ele perde arbitragem no barramento cheio -> o tester estoura o timeout e
+// acusa "sonda desconectada". Solucao: so manter o one-shot ENQUANTO o tester nao
+// foi confirmado. Assim que chega trafego pelo lado MCP (= ha outro no' ativo, logo
+// ha ACK e pode haver arbitragem concorrente), desliga o one-shot e volta a
+// retransmitir normalmente. O mcpHealth (bus-off) continua sendo a rede de seguranca.
+bool mcpOneShot = true;              // estado atual do bit OSM (setup liga = true)
+const uint32_t MCP_ACK_ALIVE_MS = 500; // RX recente no MCP => tester vivo (ACK disponivel)
+
 // Ciclo do Piso 2 (Piso1 <-> Piso2 no tempo, so quando corrigindo)
 //   FP_WAIT: venceu o tempo Y -> AGUARDA o O2 encostar/furar o Piso 1 p/ mergulhar
 enum FloorPhase { FP_HOLD1, FP_WAIT, FP_DOWN, FP_HOLD2, FP_UP };
@@ -297,8 +309,21 @@ void mcpHealth() {
   if ((eflg & MCP_EFLG_TXBO) || CAN_MCP.errorCountTX() >= 255) {
     CAN_MCP.begin(MCP_ANY, CAN_250KBPS, MCP_16MHZ);  // soft-reset + reconfigura
     CAN_MCP.setMode(MCP_NORMAL);
-    CAN_MCP.enOneShotTX();                            // mantem o one-shot apos o reset
+    CAN_MCP.enOneShotTX();                            // reset volta ao estado seguro
+    mcpOneShot = true;                               // (one-shot ligado)
     mcpRecoverCount++;
+    return;                                           // so recupera nesta volta
+  }
+
+  // One-shot dinamico: tester confirmado (RX recente no MCP = ha no' ativo dando
+  // ACK e podendo concorrer na arbitragem) -> DESLIGA o one-shot p/ retransmitir e
+  // nao perder frame da sonda. Sem trafego ha um tempo -> religa (protege o key-on).
+  bool testerAlive = (lastMcpRxMs != 0) && (now - lastMcpRxMs < MCP_ACK_ALIVE_MS);
+  bool wantOneShot = !testerAlive;
+  if (wantOneShot != mcpOneShot) {
+    if (wantOneShot) CAN_MCP.enOneShotTX();
+    else             CAN_MCP.disOneShotTX();
+    mcpOneShot = wantOneShot;
   }
 }
 
@@ -333,7 +358,11 @@ void setup() {
   // sem parar: os 3 buffers de TX enchem, o sendMsg gira ate TIMEOUTVALUE e o
   // loop() para de ler o outro lado -> CAN A fica muda. Em one-shot cada frame e'
   // tentado 1x e, falhando, o buffer e' liberado na hora (sem travar o loop).
+  // Ligamos AQUI (estado seguro p/ o key-on). Depois o mcpHealth() o DESLIGA
+  // assim que o tester for confirmado (RX no MCP), p/ nao perder frame da sonda
+  // por perda de arbitragem em marcha. Ver mcpOneShot / MCP_ACK_ALIVE_MS.
   CAN_MCP.enOneShotTX();
+  mcpOneShot = true;
 
   // ---- TWAI / CAN nativo (lado do diagnostico) : 250 kbps ----
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX, TWAI_RX, TWAI_MODE_NORMAL);
@@ -415,10 +444,12 @@ void loop() {
     // Diagnostico do MCP (CAN A): rx = frames recebidos; eflg = registrador de
     // erro (0x20=bus-off); tec/rec = contadores de erro TX/RX; recover = quantas
     // vezes o MCP foi re-inicializado. Se rx NAO sobe, CAN A nao recebe nada.
-    Serial.printf("MCP  rx=%lu eflg=0x%02X tec=%u rec=%u recover=%lu\n",
+    // oneshot=1 -> protegendo key-on (descarta sem retransmitir); =0 -> tester
+    // confirmado, retransmitindo normal (esperado EM MARCHA).
+    Serial.printf("MCP  rx=%lu eflg=0x%02X tec=%u rec=%u recover=%lu oneshot=%d\n",
                   (unsigned long)mcpRxCount, CAN_MCP.getError(),
                   CAN_MCP.errorCountTX(), CAN_MCP.errorCountRX(),
-                  (unsigned long)mcpRecoverCount);
+                  (unsigned long)mcpRecoverCount, mcpOneShot ? 1 : 0);
   }
   // Envia telemetria assim que a rede sobe (nao espera o 1o frame do sensor):
   // assim o status "ok" de cada CAN ja aparece na pagina mesmo sem dados ainda.
